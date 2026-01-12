@@ -10,7 +10,17 @@ if (NOT XPLANE_SDK_PATH OR NOT EXISTS "${XPLANE_SDK_PATH}/CHeaders/XPLM/XPLMPlug
     message(FATAL_ERROR "Set XPLANE_SDK_PATH to the X-Plane SDK root (contains CHeaders).")
 endif()
 
-if (NOT WIN32)
+set(IS_WINDOWS_BUILD OFF)
+if (WIN32 OR MINGW OR (CMAKE_SYSTEM_NAME STREQUAL "Windows") OR (CMAKE_C_COMPILER MATCHES "mingw"))
+    set(IS_WINDOWS_BUILD ON)
+endif()
+
+option(YAL_USE_CURL "Use libcurl for HTTP (non-Windows)" ON)
+if (IS_WINDOWS_BUILD)
+    set(YAL_USE_CURL OFF)
+endif()
+
+if (YAL_USE_CURL)
     find_package(CURL REQUIRED)
 endif()
 
@@ -26,7 +36,7 @@ if(APPLE)
     target_compile_definitions(HoppieHelper PRIVATE APL=1 IBM=0 LIN=0)
     target_link_options(HoppieHelper PRIVATE "-F${XPLANE_SDK_PATH}/Libraries/Mac")
     target_link_libraries(HoppieHelper PRIVATE "-framework XPLM" "-framework XPWidgets")
-elseif(WIN32)
+elseif(IS_WINDOWS_BUILD)
     target_compile_definitions(HoppieHelper PRIVATE APL=0 IBM=1 LIN=0)
     target_link_libraries(HoppieHelper PRIVATE
         "${XPLANE_SDK_PATH}/Libraries/Win/XPLM_64.lib"
@@ -34,8 +44,10 @@ elseif(WIN32)
         ws2_32
         winhttp
     )
-    if(MINGW)
-        target_link_options(HoppieHelper PRIVATE "-static" "-static-libgcc" "-static-libstdc++")
+    if(MINGW OR (CMAKE_C_COMPILER MATCHES "mingw"))
+        target_compile_options(HoppieHelper PRIVATE "-mthreads")
+        target_link_libraries(HoppieHelper PRIVATE winpthread)
+        target_link_options(HoppieHelper PRIVATE "-mthreads" "-static" "-static-libgcc" "-static-libstdc++")
     endif()
 else()
     target_compile_definitions(HoppieHelper PRIVATE APL=0 IBM=0 LIN=1)
@@ -47,7 +59,7 @@ endif()
 
 target_compile_definitions(HoppieHelper PRIVATE XPLM200=1 XPLM210=1 XPLM300=1 XPLM301=1 XPLM303=1 XPLM400=1)
 
-if (NOT WIN32)
+if (YAL_USE_CURL)
     target_link_libraries(HoppieHelper PRIVATE CURL::libcurl)
 endif()
 
@@ -56,7 +68,7 @@ set_target_properties(HoppieHelper PROPERTIES
     SUFFIX ".xpl"
 )
 
-if (WIN32)
+if (IS_WINDOWS_BUILD)
     set_target_properties(HoppieHelper PROPERTIES OUTPUT_NAME "win")
 elseif (APPLE)
     set_target_properties(HoppieHelper PROPERTIES OUTPUT_NAME "mac")

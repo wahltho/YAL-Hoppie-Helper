@@ -92,6 +92,9 @@ bool g_pollPending = false;
 double g_nextPollTime = 0.0;
 int g_debugLevel = 1;
 std::string g_lastStatus;
+bool g_refsReady = false;
+bool g_loggedMissingRefs = false;
+double g_nextRefScanTime = 0.0;
 
 enum LogLevel { LOG_ERR = 1, LOG_INFO = 2, LOG_DBG = 3 };
 
@@ -99,6 +102,8 @@ std::string GetDataRefString(XPLMDataRef dr);
 void SetDataRefString(XPLMDataRef dr, const std::string& value);
 bool GetDataRefBool(XPLMDataRef dr);
 void SetDataRefBool(XPLMDataRef dr, bool value);
+bool HasCoreDataRefs();
+void RefreshDataRefs(double now);
 
 void Log(LogLevel level, const std::string& msg) {
     if (g_debugLevel < level) {
@@ -650,6 +655,12 @@ void UpdateCommReady(const std::string& logon, const std::string& callsign) {
 float FlightLoopCallback(float, float, int, void*) {
     g_debugLevel = GetDebugLevel();
 
+    double now = XPLMGetElapsedTime();
+    RefreshDataRefs(now);
+    if (!g_refsReady) {
+        return kFlightLoopInterval;
+    }
+
     DrainResults();
     ClearInboxIfRequested();
 
@@ -679,7 +690,6 @@ float FlightLoopCallback(float, float, int, void*) {
         }
     }
 
-    double now = XPLMGetElapsedTime();
     if (commReady && !g_pollPending && now >= g_nextPollTime) {
         std::string existing = Trim(GetDataRefString(g_dref.poll_message_packet));
         if (existing.empty()) {
@@ -726,6 +736,46 @@ void FindDataRefs() {
     }
 }
 
+bool HasCoreDataRefs() {
+    return g_dref.logon
+        && g_dref.comm_ready
+        && g_dref.send_message_to
+        && g_dref.send_message_type
+        && g_dref.send_message_packet
+        && g_dref.poll_message_packet
+        && g_dref.poll_queue_clear
+        && g_dref.callsign
+        && g_dref.send_callsign;
+}
+
+void RefreshDataRefs(double now) {
+    if (g_refsReady) {
+        if (!HasCoreDataRefs()) {
+            g_refsReady = false;
+            g_nextRefScanTime = now;
+            Log(LOG_ERR, "Lost required datarefs. Will retry.");
+        }
+        return;
+    }
+
+    if (now < g_nextRefScanTime) {
+        return;
+    }
+
+    FindDataRefs();
+    g_refsReady = HasCoreDataRefs();
+    g_nextRefScanTime = now + 2.0;
+
+    if (g_refsReady) {
+        g_nextPollTime = now + kPollIntervalSeconds;
+        g_loggedMissingRefs = false;
+        Log(LOG_INFO, "Required datarefs found. Helper ready.");
+    } else if (!g_loggedMissingRefs) {
+        g_loggedMissingRefs = true;
+        Log(LOG_INFO, "Waiting for YAL datarefs...");
+    }
+}
+
 }  // namespace
 
 PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
@@ -751,6 +801,16 @@ PLUGIN_API int XPluginEnable() {
     g_running.store(true);
     g_worker = std::thread(WorkerLoop);
     g_nextPollTime = XPLMGetElapsedTime() + kPollIntervalSeconds;
+    FindDataRefs();
+    g_refsReady = HasCoreDataRefs();
+    g_loggedMissingRefs = false;
+    g_nextRefScanTime = 0.0;
+    if (!g_refsReady) {
+        g_loggedMissingRefs = true;
+        Log(LOG_INFO, "Waiting for YAL datarefs...");
+    } else {
+        Log(LOG_INFO, "Required datarefs found. Helper ready.");
+    }
     XPLMRegisterFlightLoopCallback(FlightLoopCallback, kFlightLoopInterval, nullptr);
     SetDataRefString(g_dref.last_error, "");
     SetDataRefString(g_dref.last_http, "");

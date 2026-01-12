@@ -19,6 +19,20 @@ Requirements:
 ### Common Requirements
 - X-Plane SDK path: `-DXPLANE_SDK_PATH=../SDKs/XPlane_SDK` (absolute paths are fine; in containers use a container path).
 
+### Speed Tips (optional)
+- Reuse build directories; only rerun `cmake -S ...` when CMake/toolchain settings change.
+- Quick rebuilds: `cmake --build build-<plat> --config Release`
+- If Ninja is available, add `-G Ninja` on macOS/Linux for faster incremental builds.
+- For container builds, create a local image once to avoid `apt-get` on every run:
+```bash
+podman build -t yal-xplane-build - <<'EOF'
+FROM ubuntu:22.04
+RUN apt-get update && apt-get install -y \
+    build-essential cmake ninja-build libcurl4-openssl-dev mingw-w64
+EOF
+```
+Then replace `ubuntu:22.04` with `yal-xplane-build` and drop the `apt-get ...` part in the container commands below.
+
 ### macOS (universal recommended)
 ```bash
 cmake -S . -B build-mac -DCMAKE_BUILD_TYPE=Release -DXPLANE_SDK_PATH="../SDKs/XPlane_SDK"
