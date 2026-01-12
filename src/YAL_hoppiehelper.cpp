@@ -3,7 +3,12 @@
 #include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
 
+#ifdef _WIN32
+#include <windows.h>
+#include <winhttp.h>
+#else
 #include <curl/curl.h>
+#endif
 
 #include <atomic>
 #include <cstring>
@@ -15,11 +20,14 @@
 #include <string>
 #include <thread>
 
+PLUGIN_API void XPluginDisable(void);
+
 namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC)";
+constexpr const char* kPluginVersion = "1.0.0";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.0.0";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 
 constexpr float kFlightLoopInterval = 1.0f;
@@ -153,6 +161,44 @@ std::string ToUpperAscii(const std::string& s) {
     return out;
 }
 
+std::string UrlEncode(const std::string& input) {
+    static const char* hex = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(input.size() * 3);
+    for (unsigned char c : input) {
+        if ((c >= 'a' && c <= 'z')
+            || (c >= 'A' && c <= 'Z')
+            || (c >= '0' && c <= '9')
+            || c == '-' || c == '_' || c == '.' || c == '~') {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(hex[(c >> 4) & 0x0F]);
+            out.push_back(hex[c & 0x0F]);
+        }
+    }
+    return out;
+}
+
+#ifdef _WIN32
+std::wstring Utf8ToWide(const std::string& s) {
+    if (s.empty()) {
+        return std::wstring();
+    }
+    int len = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), nullptr, 0);
+    if (len <= 0) {
+        return std::wstring();
+    }
+    std::wstring out(len, L'\0');
+    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), static_cast<int>(s.size()), &out[0], len);
+    return out;
+}
+
+std::string WinHttpError(DWORD code) {
+    return "WinHTTP error " + std::to_string(code);
+}
+#endif
+
 std::string GetDataRefString(XPLMDataRef dr) {
     if (!dr) {
         return "";
@@ -173,10 +219,10 @@ void SetDataRefString(XPLMDataRef dr, const std::string& value) {
         return;
     }
     if (value.empty()) {
-        XPLMSetDatab(dr, "", 0, 0);
+        XPLMSetDatab(dr, nullptr, 0, 0);
         return;
     }
-    XPLMSetDatab(dr, value.c_str(), 0, static_cast<int>(value.size()));
+    XPLMSetDatab(dr, const_cast<char*>(value.data()), 0, static_cast<int>(value.size()));
 }
 
 bool GetDataRefBool(XPLMDataRef dr) {
@@ -209,14 +255,139 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
+#ifndef _WIN32
 size_t CurlWrite(void* contents, size_t size, size_t nmemb, void* userp) {
     size_t total = size * nmemb;
     std::string* out = static_cast<std::string*>(userp);
     out->append(static_cast<char*>(contents), total);
     return total;
 }
+#endif
 
 bool PostForm(const std::string& postFields, std::string* response, std::string* error, long* httpCode) {
+#ifdef _WIN32
+    if (response) {
+        response->clear();
+    }
+    if (httpCode) {
+        *httpCode = 0;
+    }
+
+    std::wstring urlW = Utf8ToWide(kHoppieUrl);
+    URL_COMPONENTS comps{};
+    comps.dwStructSize = sizeof(comps);
+    comps.dwSchemeLength = static_cast<DWORD>(-1);
+    comps.dwHostNameLength = static_cast<DWORD>(-1);
+    comps.dwUrlPathLength = static_cast<DWORD>(-1);
+    comps.dwExtraInfoLength = static_cast<DWORD>(-1);
+
+    if (!WinHttpCrackUrl(urlW.c_str(), 0, 0, &comps)) {
+        if (error) { *error = WinHttpError(GetLastError()); }
+        return false;
+    }
+
+    std::wstring host(comps.lpszHostName, comps.dwHostNameLength);
+    std::wstring path;
+    if (comps.dwUrlPathLength && comps.lpszUrlPath) {
+        path.assign(comps.lpszUrlPath, comps.dwUrlPathLength);
+    }
+    if (comps.dwExtraInfoLength && comps.lpszExtraInfo) {
+        path.append(comps.lpszExtraInfo, comps.dwExtraInfoLength);
+    }
+    bool secure = comps.nScheme == INTERNET_SCHEME_HTTPS;
+
+    HINTERNET hSession = WinHttpOpen(L"YAL_hoppiehelper/1.0",
+                                     WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                     WINHTTP_NO_PROXY_NAME,
+                                     WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) {
+        if (error) { *error = WinHttpError(GetLastError()); }
+        return false;
+    }
+    WinHttpSetTimeouts(hSession, 10000, 10000, 15000, 15000);
+
+    HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), comps.nPort, 0);
+    if (!hConnect) {
+        if (error) { *error = WinHttpError(GetLastError()); }
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD flags = secure ? WINHTTP_FLAG_SECURE : 0;
+    HINTERNET hRequest = WinHttpOpenRequest(hConnect, L"POST", path.c_str(),
+                                            nullptr, WINHTTP_NO_REFERER,
+                                            WINHTTP_DEFAULT_ACCEPT_TYPES, flags);
+    if (!hRequest) {
+        if (error) { *error = WinHttpError(GetLastError()); }
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    const wchar_t* headers = L"Content-Type: application/x-www-form-urlencoded\r\n";
+    BOOL ok = WinHttpSendRequest(hRequest, headers, -1L,
+                                 (LPVOID)postFields.data(),
+                                 static_cast<DWORD>(postFields.size()),
+                                 static_cast<DWORD>(postFields.size()), 0);
+    if (!ok) {
+        if (error) { *error = WinHttpError(GetLastError()); }
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    ok = WinHttpReceiveResponse(hRequest, nullptr);
+    if (!ok) {
+        if (error) { *error = WinHttpError(GetLastError()); }
+        WinHttpCloseHandle(hRequest);
+        WinHttpCloseHandle(hConnect);
+        WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    DWORD status = 0;
+    DWORD statusSize = sizeof(status);
+    if (WinHttpQueryHeaders(hRequest, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                            WINHTTP_HEADER_NAME_BY_INDEX, &status, &statusSize,
+                            WINHTTP_NO_HEADER_INDEX)) {
+        if (httpCode) {
+            *httpCode = static_cast<long>(status);
+        }
+    }
+
+    std::string resp;
+    for (;;) {
+        DWORD available = 0;
+        if (!WinHttpQueryDataAvailable(hRequest, &available)) {
+            break;
+        }
+        if (available == 0) {
+            break;
+        }
+        std::string chunk;
+        chunk.resize(available);
+        DWORD read = 0;
+        if (!WinHttpReadData(hRequest, &chunk[0], available, &read)) {
+            break;
+        }
+        chunk.resize(read);
+        resp += chunk;
+    }
+
+    WinHttpCloseHandle(hRequest);
+    WinHttpCloseHandle(hConnect);
+    WinHttpCloseHandle(hSession);
+
+    if (response) {
+        *response = resp;
+    }
+    if (status != 200) {
+        if (error) { *error = "HTTP " + std::to_string(status); }
+        return false;
+    }
+    return true;
+#else
     CURL* curl = curl_easy_init();
     if (!curl) {
         if (error) { *error = "curl_easy_init failed"; }
@@ -255,32 +426,19 @@ bool PostForm(const std::string& postFields, std::string* response, std::string*
         *response = resp;
     }
     return true;
+#endif
 }
 
 bool BuildPostFields(const HttpJob& job, std::string* out) {
-    CURL* curl = curl_easy_init();
-    if (!curl) {
-        return false;
-    }
-
-    auto esc = [&](const std::string& in) -> std::string {
-        char* e = curl_easy_escape(curl, in.c_str(), static_cast<int>(in.size()));
-        if (!e) return "";
-        std::string outStr(e);
-        curl_free(e);
-        return outStr;
-    };
-
     std::ostringstream ss;
-    ss << "logon=" << esc(job.logon)
-       << "&from=" << esc(job.from)
-       << "&to=" << esc(job.to)
-       << "&type=" << esc(job.msg_type);
+    ss << "logon=" << UrlEncode(job.logon)
+       << "&from=" << UrlEncode(job.from)
+       << "&to=" << UrlEncode(job.to)
+       << "&type=" << UrlEncode(job.msg_type);
     if (!job.packet.empty()) {
-        ss << "&packet=" << esc(job.packet);
+        ss << "&packet=" << UrlEncode(job.packet);
     }
 
-    curl_easy_cleanup(curl);
     *out = ss.str();
     return true;
 }
@@ -575,14 +733,18 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     std::strncpy(outSig, kPluginSig, 255);
     std::strncpy(outDesc, kPluginDesc, 255);
 
+#ifndef _WIN32
     curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
     FindDataRefs();
     return 1;
 }
 
 PLUGIN_API void XPluginStop() {
     XPluginDisable();
+#ifndef _WIN32
     curl_global_cleanup();
+#endif
 }
 
 PLUGIN_API int XPluginEnable() {
@@ -599,7 +761,7 @@ PLUGIN_API int XPluginEnable() {
         XPLMSetDatai(g_dref.poll_count, 0);
     }
     SetStatus("INIT");
-    Log(LOG_INFO, "Enabled");
+    Log(LOG_INFO, std::string("Enabled v") + kPluginVersion);
     return 1;
 }
 
