@@ -10,12 +10,15 @@
 #include <curl/curl.h>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstring>
 #include <condition_variable>
 #include <cctype>
 #include <mutex>
 #include <queue>
+#include <random>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -31,8 +34,10 @@ constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.0.0
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 
 constexpr float kFlightLoopInterval = 1.0f;
-constexpr double kPollIntervalSeconds = 65.0;
-constexpr double kPollIntervalShortSeconds = 20.0;
+constexpr int kPollDefaultMinSeconds = 45;
+constexpr int kPollDefaultMaxSeconds = 75;
+constexpr int kPollFastMinSeconds = 12;
+constexpr int kPollFastMaxSeconds = 18;
 
 struct DataRefs {
     XPLMDataRef send_queue = nullptr;
@@ -41,6 +46,7 @@ struct DataRefs {
     XPLMDataRef send_message_packet = nullptr;
     XPLMDataRef callsign = nullptr;
     XPLMDataRef send_callsign = nullptr;
+    XPLMDataRef poll_frequency_fast = nullptr;
     XPLMDataRef poll_queue = nullptr;
     XPLMDataRef poll_message_origin = nullptr;
     XPLMDataRef poll_message_from = nullptr;
@@ -58,6 +64,39 @@ struct DataRefs {
     XPLMDataRef hbdr_ready = nullptr;
     XPLMDataRef avionics_on = nullptr;
 };
+
+constexpr int kNumberDataRefTypes = xplmType_Int | xplmType_Float | xplmType_Double;
+
+struct DataRefSlot {
+    std::string text;
+    double number = 0.0;
+};
+
+struct OwnedDataRef {
+    const char* name = nullptr;
+    int types = 0;
+    bool isString = false;
+    DataRefSlot slot;
+    XPLMDataRef ref = nullptr;
+    bool owned = false;
+};
+
+std::array<OwnedDataRef, 14> g_ownedDataRefs = {{
+    {"hoppiebridge/send_queue", xplmType_Data, true},
+    {"hoppiebridge/send_message_to", xplmType_Data, true},
+    {"hoppiebridge/send_message_type", xplmType_Data, true},
+    {"hoppiebridge/send_message_packet", xplmType_Data, true},
+    {"hoppiebridge/send_callsign", xplmType_Data, true},
+    {"hoppiebridge/poll_frequency_fast", kNumberDataRefTypes, false},
+    {"hoppiebridge/poll_queue", xplmType_Data, true},
+    {"hoppiebridge/poll_message_origin", xplmType_Data, true},
+    {"hoppiebridge/poll_message_from", xplmType_Data, true},
+    {"hoppiebridge/poll_message_type", xplmType_Data, true},
+    {"hoppiebridge/poll_message_packet", xplmType_Data, true},
+    {"hoppiebridge/poll_queue_clear", kNumberDataRefTypes, false},
+    {"hoppiebridge/callsign", xplmType_Data, true},
+    {"hoppiebridge/comm_ready", kNumberDataRefTypes, false},
+}};
 
 DataRefs g_dref;
 std::atomic<bool> g_running{false};
@@ -86,6 +125,8 @@ std::mutex g_mutex;
 std::condition_variable g_cv;
 std::queue<HttpJob> g_jobs;
 std::queue<HttpResult> g_results;
+std::mutex g_ownedMutex;
+std::mt19937 g_rng{std::random_device{}()};
 
 bool g_sendPending = false;
 bool g_pollPending = false;
@@ -94,7 +135,19 @@ int g_debugLevel = 1;
 std::string g_lastStatus;
 bool g_refsReady = false;
 bool g_loggedMissingRefs = false;
+bool g_loggedHbdrFound = false;
+bool g_loggedHbdrWritable = false;
+bool g_loggedHbdrTypes = false;
+bool g_loggedStartupSummary = false;
+bool g_commReadyKnown = false;
+bool g_lastCommReady = false;
+bool g_pollModeKnown = false;
+bool g_lastFastPoll = false;
+bool g_logonKnown = false;
+bool g_logonAvailable = false;
+std::string g_lastCallsign;
 double g_nextRefScanTime = 0.0;
+bool g_commEstablished = false;
 
 enum LogLevel { LOG_ERR = 1, LOG_INFO = 2, LOG_DBG = 3 };
 
@@ -102,14 +155,33 @@ std::string GetDataRefString(XPLMDataRef dr);
 void SetDataRefString(XPLMDataRef dr, const std::string& value);
 bool GetDataRefBool(XPLMDataRef dr);
 void SetDataRefBool(XPLMDataRef dr, bool value);
+std::string DataRefTypeString(int types);
+int GetDataiCB(void* refcon);
+void SetDataiCB(void* refcon, int value);
+float GetDatafCB(void* refcon);
+void SetDatafCB(void* refcon, float value);
+double GetDatadCB(void* refcon);
+void SetDatadCB(void* refcon, double value);
+int GetDatabCB(void* refcon, void* outValue, int offset, int max);
+void SetDatabCB(void* refcon, void* inValue, int offset, int max);
 bool HasCoreDataRefs();
 void RefreshDataRefs(double now);
+void RefreshHbdrReady();
+void EnsureHoppieDataRefs();
+void UnregisterHoppieDataRefs();
+double NextPollIntervalSeconds(bool fastPoll);
+void ScheduleNextPollTime(double now);
+void LogReadySummary();
+void LogCallsignState(const std::string& callsign, bool justSet);
+void LogCommReadyState(bool ready);
+void LogPollModeChange();
+void LogLogonState(const std::string& logon);
 
 void Log(LogLevel level, const std::string& msg) {
     if (g_debugLevel < level) {
         return;
     }
-    std::string line = std::string("[HoppieHelper] ") + msg + "\n";
+    std::string line = std::string("[YAL HoppieHelper] ") + msg + "\n";
     XPLMDebugString(line.c_str());
 }
 
@@ -158,14 +230,6 @@ std::string Trim(const std::string& s) {
     return s.substr(start, end - start);
 }
 
-std::string ToUpperAscii(const std::string& s) {
-    std::string out = s;
-    for (char& c : out) {
-        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-    }
-    return out;
-}
-
 std::string UrlEncode(const std::string& input) {
     static const char* hex = "0123456789ABCDEF";
     std::string out;
@@ -208,15 +272,24 @@ std::string GetDataRefString(XPLMDataRef dr) {
     if (!dr) {
         return "";
     }
-    char buffer[2048];
-    int len = XPLMGetDatab(dr, buffer, 0, static_cast<int>(sizeof(buffer)));
+    int len = XPLMGetDatab(dr, nullptr, 0, 0);
     if (len <= 0) {
         return "";
     }
-    if (len > static_cast<int>(sizeof(buffer))) {
-        len = static_cast<int>(sizeof(buffer));
+    if (len > 2047) {
+        len = 2047;
     }
-    return std::string(buffer, buffer + len);
+    std::string out(static_cast<size_t>(len), '\0');
+    int read = XPLMGetDatab(dr, &out[0], 0, len);
+    if (read <= 0) {
+        return "";
+    }
+    out.resize(static_cast<size_t>(read));
+    size_t nullPos = out.find('\0');
+    if (nullPos != std::string::npos) {
+        out.resize(nullPos);
+    }
+    return out;
 }
 
 void SetDataRefString(XPLMDataRef dr, const std::string& value) {
@@ -224,7 +297,8 @@ void SetDataRefString(XPLMDataRef dr, const std::string& value) {
         return;
     }
     if (value.empty()) {
-        XPLMSetDatab(dr, nullptr, 0, 0);
+        const char zero = '\0';
+        XPLMSetDatab(dr, const_cast<char*>(&zero), 0, 1);
         return;
     }
     XPLMSetDatab(dr, const_cast<char*>(value.data()), 0, static_cast<int>(value.size()));
@@ -241,7 +315,286 @@ void SetDataRefBool(XPLMDataRef dr, bool value) {
     if (!dr) {
         return;
     }
-    XPLMSetDatai(dr, value ? 1 : 0);
+    int types = XPLMGetDataRefTypes(dr);
+    int iv = value ? 1 : 0;
+    float fv = value ? 1.0f : 0.0f;
+    double dv = value ? 1.0 : 0.0;
+    bool wrote = false;
+    if (types & xplmType_Int) {
+        XPLMSetDatai(dr, iv);
+        wrote = true;
+    }
+    if (types & xplmType_Float) {
+        XPLMSetDataf(dr, fv);
+        wrote = true;
+    }
+    if (types & xplmType_Double) {
+        XPLMSetDatad(dr, dv);
+        wrote = true;
+    }
+    if (!wrote) {
+        XPLMSetDatai(dr, iv);
+    }
+}
+
+std::string DataRefTypeString(int types) {
+    std::string out;
+    if (types & xplmType_Int) out += "int|";
+    if (types & xplmType_Float) out += "float|";
+    if (types & xplmType_Double) out += "double|";
+    if (types & xplmType_Data) out += "data|";
+    if (out.empty()) {
+        return "unknown";
+    }
+    out.pop_back();
+    return out;
+}
+
+int GetDataiCB(void* refcon) {
+    auto* slot = static_cast<DataRefSlot*>(refcon);
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    return static_cast<int>(slot->number);
+}
+
+void SetDataiCB(void* refcon, int value) {
+    auto* slot = static_cast<DataRefSlot*>(refcon);
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    slot->number = static_cast<double>(value);
+}
+
+float GetDatafCB(void* refcon) {
+    auto* slot = static_cast<DataRefSlot*>(refcon);
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    return static_cast<float>(slot->number);
+}
+
+void SetDatafCB(void* refcon, float value) {
+    auto* slot = static_cast<DataRefSlot*>(refcon);
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    slot->number = static_cast<double>(value);
+}
+
+double GetDatadCB(void* refcon) {
+    auto* slot = static_cast<DataRefSlot*>(refcon);
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    return slot->number;
+}
+
+void SetDatadCB(void* refcon, double value) {
+    auto* slot = static_cast<DataRefSlot*>(refcon);
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    slot->number = value;
+}
+
+int GetDatabCB(void* refcon, void* outValue, int offset, int max) {
+    auto* slot = static_cast<DataRefSlot*>(refcon);
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    if (offset < 0) {
+        return 0;
+    }
+    int len = static_cast<int>(slot->text.size());
+    if (!outValue) {
+        return len;
+    }
+    if (offset >= len) {
+        return 0;
+    }
+    int count = std::min(max, len - offset);
+    std::memcpy(outValue, slot->text.data() + offset, static_cast<size_t>(count));
+    return count;
+}
+
+void SetDatabCB(void* refcon, void* inValue, int offset, int max) {
+    auto* slot = static_cast<DataRefSlot*>(refcon);
+    std::lock_guard<std::mutex> lock(g_ownedMutex);
+    if (offset < 0) {
+        return;
+    }
+    if (!inValue || max <= 0) {
+        if (offset == 0) {
+            slot->text.clear();
+        }
+        return;
+    }
+    const char* data = static_cast<const char*>(inValue);
+    if (offset == 0) {
+        if (max == 1 && data[0] == '\0') {
+            slot->text.clear();
+            return;
+        }
+        slot->text.assign(data, data + max);
+        return;
+    }
+    if (offset > static_cast<int>(slot->text.size())) {
+        slot->text.resize(static_cast<size_t>(offset), '\0');
+    }
+    if (offset + max > static_cast<int>(slot->text.size())) {
+        slot->text.resize(static_cast<size_t>(offset + max), '\0');
+    }
+    std::memcpy(&slot->text[0] + offset, data, static_cast<size_t>(max));
+}
+
+void EnsureHoppieDataRefs() {
+    int created = 0;
+    for (auto& def : g_ownedDataRefs) {
+        if (def.owned) {
+            continue;
+        }
+        if (XPLMFindDataRef(def.name)) {
+            continue;
+        }
+        XPLMDataRef ref = XPLMRegisterDataAccessor(
+            def.name,
+            def.types,
+            1,
+            def.isString ? nullptr : GetDataiCB,
+            def.isString ? nullptr : SetDataiCB,
+            def.isString ? nullptr : GetDatafCB,
+            def.isString ? nullptr : SetDatafCB,
+            def.isString ? nullptr : GetDatadCB,
+            def.isString ? nullptr : SetDatadCB,
+            nullptr,
+            nullptr,
+            nullptr,
+            nullptr,
+            def.isString ? GetDatabCB : nullptr,
+            def.isString ? SetDatabCB : nullptr,
+            &def.slot,
+            &def.slot);
+        if (!ref) {
+            Log(LOG_ERR, std::string("Failed to register dataref: ") + def.name);
+            continue;
+        }
+        def.ref = ref;
+        def.owned = true;
+        def.slot.text.clear();
+        def.slot.number = 0.0;
+        ++created;
+    }
+    if (created > 0) {
+        Log(LOG_INFO, "Registered " + std::to_string(created) + " hoppiebridge datarefs.");
+    }
+}
+
+void UnregisterHoppieDataRefs() {
+    for (auto& def : g_ownedDataRefs) {
+        if (!def.owned || !def.ref) {
+            continue;
+        }
+        XPLMUnregisterDataAccessor(def.ref);
+        def.ref = nullptr;
+        def.owned = false;
+    }
+}
+
+bool IsFastPollEnabled() {
+    return g_dref.poll_frequency_fast && XPLMGetDatai(g_dref.poll_frequency_fast) != 0;
+}
+
+double NextPollIntervalSeconds(bool fastPoll) {
+    int minSeconds = kPollDefaultMinSeconds;
+    int maxSeconds = kPollDefaultMaxSeconds;
+    if (fastPoll) {
+        minSeconds = kPollFastMinSeconds;
+        maxSeconds = kPollFastMaxSeconds;
+    }
+    if (maxSeconds < minSeconds) {
+        std::swap(maxSeconds, minSeconds);
+    }
+    std::uniform_int_distribution<int> dist(minSeconds, maxSeconds);
+    return static_cast<double>(dist(g_rng));
+}
+
+void ScheduleNextPollTime(double now) {
+    bool fast = IsFastPollEnabled();
+    double interval = NextPollIntervalSeconds(fast);
+    g_nextPollTime = now + interval;
+    Log(LOG_DBG, "Next poll in " + std::to_string(static_cast<int>(interval))
+        + "s (" + (fast ? std::string("fast") : std::string("normal")) + ").");
+}
+
+void LogReadySummary() {
+    if (g_loggedStartupSummary) {
+        return;
+    }
+    g_loggedStartupSummary = true;
+    std::string pollMode = IsFastPollEnabled() ? "fast" : "normal";
+    std::string hbdrState = g_dref.hbdr_ready ? "found" : "missing";
+    std::string hbdrWritable = "unknown";
+    if (g_dref.hbdr_ready) {
+        hbdrWritable = XPLMCanWriteDataRef(g_dref.hbdr_ready) ? "yes" : "no";
+    }
+    Log(LOG_INFO, "Helper ready. HBDR_ready " + hbdrState + " writable=" + hbdrWritable
+        + ", poll_mode=" + pollMode + ".");
+}
+
+void LogCallsignState(const std::string& callsign, bool justSet) {
+    if (justSet) {
+        g_lastCallsign = callsign;
+        return;
+    }
+    if (callsign == g_lastCallsign) {
+        return;
+    }
+    if (!callsign.empty() && g_lastCallsign.empty()) {
+        Log(LOG_INFO, "Callsign available: " + callsign);
+    } else if (callsign.empty() && !g_lastCallsign.empty()) {
+        Log(LOG_INFO, "Callsign cleared.");
+    } else if (!callsign.empty() && !g_lastCallsign.empty()) {
+        Log(LOG_INFO, "Callsign changed: " + callsign);
+    }
+    g_lastCallsign = callsign;
+}
+
+void LogCommReadyState(bool ready) {
+    if (!g_commReadyKnown) {
+        g_commReadyKnown = true;
+        g_lastCommReady = ready;
+        if (ready) {
+            Log(LOG_INFO, "Comm ready.");
+        }
+        return;
+    }
+    if (ready == g_lastCommReady) {
+        return;
+    }
+    g_lastCommReady = ready;
+    Log(LOG_INFO, ready ? "Comm ready." : "Comm no longer ready.");
+}
+
+void LogPollModeChange() {
+    bool fast = IsFastPollEnabled();
+    if (!g_pollModeKnown) {
+        g_pollModeKnown = true;
+        g_lastFastPoll = fast;
+        return;
+    }
+    if (fast == g_lastFastPoll) {
+        return;
+    }
+    g_lastFastPoll = fast;
+    Log(LOG_INFO, std::string("Poll mode changed: ") + (fast ? "fast" : "normal") + ".");
+}
+
+void LogLogonState(const std::string& logon) {
+    bool available = !logon.empty();
+    if (!g_logonKnown) {
+        g_logonKnown = true;
+        g_logonAvailable = available;
+        if (available) {
+            Log(LOG_INFO, "Logon available (len=" + std::to_string(logon.size()) + ").");
+        }
+        return;
+    }
+    if (available == g_logonAvailable) {
+        return;
+    }
+    g_logonAvailable = available;
+    if (available) {
+        Log(LOG_INFO, "Logon available (len=" + std::to_string(logon.size()) + ").");
+    } else {
+        Log(LOG_INFO, "Logon cleared.");
+    }
 }
 
 std::string JsonEscape(const std::string& s) {
@@ -509,6 +862,25 @@ bool ParseOkPayload(const std::string& raw, std::string* from, std::string* type
     return true;
 }
 
+bool IsPollOkOnly(const std::string& raw) {
+    std::string s = Trim(raw);
+    if (s.size() != 2) {
+        return false;
+    }
+    return (s[0] == 'o' || s[0] == 'O') && (s[1] == 'k' || s[1] == 'K');
+}
+
+bool AreCommPrereqsReady(const std::string& logon, const std::string& callsign, bool* avionicsOkOut) {
+    bool avionicsOk = true;
+    if (g_dref.avionics_on) {
+        avionicsOk = XPLMGetDatai(g_dref.avionics_on) != 0;
+    }
+    if (avionicsOkOut) {
+        *avionicsOkOut = avionicsOk;
+    }
+    return avionicsOk && !logon.empty() && !callsign.empty();
+}
+
 void WorkerLoop() {
     while (g_running.load()) {
         HttpJob job;
@@ -565,6 +937,12 @@ void DrainResults() {
             g_pollPending = false;
             double now = XPLMGetElapsedTime();
             if (res.ok) {
+                if (IsPollOkOnly(res.response)) {
+                    if (!g_commEstablished) {
+                        Log(LOG_INFO, "Poll ok. Communication ready.");
+                    }
+                    g_commEstablished = true;
+                }
                 std::string from;
                 std::string type;
                 std::string packet;
@@ -582,11 +960,11 @@ void DrainResults() {
                 }
                 SetLastError("");
                 SetLastHttp("poll: " + std::to_string(res.httpCode));
-                g_nextPollTime = now + kPollIntervalSeconds;
+                ScheduleNextPollTime(now);
             } else {
                 SetLastError("Poll failed: " + res.error);
                 SetLastHttp("poll: " + std::to_string(res.httpCode));
-                g_nextPollTime = now + kPollIntervalShortSeconds;
+                ScheduleNextPollTime(now);
             }
         }
     }
@@ -608,34 +986,25 @@ void ClearInboxIfRequested() {
     SetDataRefBool(g_dref.poll_queue_clear, false);
 }
 
-void UpdateCallsign() {
+bool UpdateCallsign() {
     std::string pending = Trim(GetDataRefString(g_dref.send_callsign));
     if (!pending.empty()) {
-        pending = ToUpperAscii(pending);
         SetDataRefString(g_dref.callsign, pending);
         SetDataRefString(g_dref.send_callsign, "");
         Log(LOG_INFO, "Callsign set: " + pending);
+        return true;
     }
-}
-
-bool IsCommReady(const std::string& logon, const std::string& callsign) {
-    bool avionicsOk = true;
-    if (g_dref.avionics_on) {
-        avionicsOk = XPLMGetDatai(g_dref.avionics_on) != 0;
-    }
-    return avionicsOk && !logon.empty() && !callsign.empty();
+    return false;
 }
 
 void UpdateCommReady(const std::string& logon, const std::string& callsign) {
     bool avionicsOk = true;
-    if (g_dref.avionics_on) {
-        avionicsOk = XPLMGetDatai(g_dref.avionics_on) != 0;
+    bool prereqsOk = AreCommPrereqsReady(logon, callsign, &avionicsOk);
+    if (!prereqsOk) {
+        g_commEstablished = false;
     }
-    bool ready = avionicsOk && !logon.empty() && !callsign.empty();
+    bool ready = prereqsOk && g_commEstablished;
     SetDataRefBool(g_dref.comm_ready, ready);
-    if (g_dref.hbdr_ready) {
-        SetDataRefBool(g_dref.hbdr_ready, ready);
-    }
 
     if (!ready) {
         if (!avionicsOk) {
@@ -644,6 +1013,8 @@ void UpdateCommReady(const std::string& logon, const std::string& callsign) {
             SetStatus("WAIT_LOGON");
         } else if (callsign.empty()) {
             SetStatus("WAIT_CALLSIGN");
+        } else if (!g_commEstablished) {
+            SetStatus("WAIT_POLL");
         } else {
             SetStatus("NOT_READY");
         }
@@ -667,11 +1038,16 @@ float FlightLoopCallback(float, float, int, void*) {
     std::string logon = Trim(GetDataRefString(g_dref.logon));
     std::string callsign = Trim(GetDataRefString(g_dref.callsign));
 
-    UpdateCallsign();
+    LogLogonState(logon);
+    bool callsignUpdated = UpdateCallsign();
     callsign = Trim(GetDataRefString(g_dref.callsign));
+    LogCallsignState(callsign, callsignUpdated);
 
     UpdateCommReady(logon, callsign);
     bool commReady = GetDataRefBool(g_dref.comm_ready);
+    LogCommReadyState(commReady);
+    LogPollModeChange();
+    bool prereqsOk = AreCommPrereqsReady(logon, callsign, nullptr);
 
     if (commReady && !g_sendPending) {
         std::string to = Trim(GetDataRefString(g_dref.send_message_to));
@@ -690,7 +1066,7 @@ float FlightLoopCallback(float, float, int, void*) {
         }
     }
 
-    if (commReady && !g_pollPending && now >= g_nextPollTime) {
+    if (prereqsOk && !g_pollPending && (!commReady || now >= g_nextPollTime)) {
         std::string existing = Trim(GetDataRefString(g_dref.poll_message_packet));
         if (existing.empty()) {
             HttpJob job;
@@ -714,6 +1090,7 @@ void FindDataRefs() {
     g_dref.send_message_packet = XPLMFindDataRef("hoppiebridge/send_message_packet");
     g_dref.callsign = XPLMFindDataRef("hoppiebridge/callsign");
     g_dref.send_callsign = XPLMFindDataRef("hoppiebridge/send_callsign");
+    g_dref.poll_frequency_fast = XPLMFindDataRef("hoppiebridge/poll_frequency_fast");
     g_dref.poll_queue = XPLMFindDataRef("hoppiebridge/poll_queue");
     g_dref.poll_message_origin = XPLMFindDataRef("hoppiebridge/poll_message_origin");
     g_dref.poll_message_from = XPLMFindDataRef("hoppiebridge/poll_message_from");
@@ -732,7 +1109,7 @@ void FindDataRefs() {
     g_dref.avionics_on = XPLMFindDataRef("sim/cockpit/electrical/avionics_on");
 
     if (!g_dref.logon) {
-        Log(LOG_ERR, "Missing dataref: YAL/hoppie/logon");
+        Log(LOG_DBG, "Missing dataref: YAL/hoppie/logon");
     }
 }
 
@@ -748,11 +1125,44 @@ bool HasCoreDataRefs() {
         && g_dref.send_callsign;
 }
 
+void RefreshHbdrReady() {
+    if (!g_dref.hbdr_ready) {
+        g_dref.hbdr_ready = XPLMFindDataRef("laminar/B738/HBDR_ready");
+        if (g_dref.hbdr_ready && !g_loggedHbdrFound) {
+            g_loggedHbdrFound = true;
+            Log(LOG_INFO, "Found HBDR_ready dataref.");
+        }
+    }
+    if (!g_dref.hbdr_ready) {
+        return;
+    }
+    if (!g_loggedHbdrTypes) {
+        g_loggedHbdrTypes = true;
+        Log(LOG_INFO, "HBDR_ready types: " + DataRefTypeString(XPLMGetDataRefTypes(g_dref.hbdr_ready)));
+    }
+    if (!g_loggedHbdrWritable && !XPLMCanWriteDataRef(g_dref.hbdr_ready)) {
+        g_loggedHbdrWritable = true;
+        Log(LOG_ERR, "HBDR_ready dataref is not writable.");
+    }
+    SetDataRefBool(g_dref.hbdr_ready, true);
+}
+
 void RefreshDataRefs(double now) {
+    RefreshHbdrReady();
     if (g_refsReady) {
         if (!HasCoreDataRefs()) {
             g_refsReady = false;
             g_nextRefScanTime = now;
+            g_commEstablished = false;
+            SetDataRefBool(g_dref.comm_ready, false);
+            g_loggedStartupSummary = false;
+            g_commReadyKnown = false;
+            g_lastCommReady = false;
+            g_pollModeKnown = false;
+            g_lastFastPoll = false;
+            g_logonKnown = false;
+            g_logonAvailable = false;
+            g_lastCallsign.clear();
             Log(LOG_ERR, "Lost required datarefs. Will retry.");
         }
         return;
@@ -762,14 +1172,16 @@ void RefreshDataRefs(double now) {
         return;
     }
 
+    EnsureHoppieDataRefs();
     FindDataRefs();
     g_refsReady = HasCoreDataRefs();
     g_nextRefScanTime = now + 2.0;
 
     if (g_refsReady) {
-        g_nextPollTime = now + kPollIntervalSeconds;
+        ScheduleNextPollTime(now);
         g_loggedMissingRefs = false;
         Log(LOG_INFO, "Required datarefs found. Helper ready.");
+        LogReadySummary();
     } else if (!g_loggedMissingRefs) {
         g_loggedMissingRefs = true;
         Log(LOG_INFO, "Waiting for YAL datarefs...");
@@ -782,16 +1194,19 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
     std::strncpy(outName, kPluginName, 255);
     std::strncpy(outSig, kPluginSig, 255);
     std::strncpy(outDesc, kPluginDesc, 255);
+    XPLMDebugString("[YAL HoppieHelper] Starting plugin\n");
 
 #ifndef _WIN32
     curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
+    EnsureHoppieDataRefs();
     FindDataRefs();
     return 1;
 }
 
 PLUGIN_API void XPluginStop() {
     XPluginDisable();
+    UnregisterHoppieDataRefs();
 #ifndef _WIN32
     curl_global_cleanup();
 #endif
@@ -800,18 +1215,31 @@ PLUGIN_API void XPluginStop() {
 PLUGIN_API int XPluginEnable() {
     g_running.store(true);
     g_worker = std::thread(WorkerLoop);
-    g_nextPollTime = XPLMGetElapsedTime() + kPollIntervalSeconds;
+    EnsureHoppieDataRefs();
     FindDataRefs();
+    ScheduleNextPollTime(XPLMGetElapsedTime());
     g_refsReady = HasCoreDataRefs();
     g_loggedMissingRefs = false;
     g_nextRefScanTime = 0.0;
+    g_loggedStartupSummary = false;
+    g_commReadyKnown = false;
+    g_lastCommReady = false;
+    g_pollModeKnown = false;
+    g_lastFastPoll = false;
+    g_logonKnown = false;
+    g_logonAvailable = false;
+    g_lastCallsign.clear();
     if (!g_refsReady) {
         g_loggedMissingRefs = true;
         Log(LOG_INFO, "Waiting for YAL datarefs...");
     } else {
         Log(LOG_INFO, "Required datarefs found. Helper ready.");
+        LogReadySummary();
     }
+    RefreshHbdrReady();
     XPLMRegisterFlightLoopCallback(FlightLoopCallback, kFlightLoopInterval, nullptr);
+    g_commEstablished = false;
+    SetDataRefBool(g_dref.comm_ready, false);
     SetDataRefString(g_dref.last_error, "");
     SetDataRefString(g_dref.last_http, "");
     if (g_dref.send_count) {
@@ -832,8 +1260,20 @@ PLUGIN_API void XPluginDisable() {
     if (g_worker.joinable()) {
         g_worker.join();
     }
+    g_commEstablished = false;
     SetDataRefBool(g_dref.comm_ready, false);
     SetDataRefBool(g_dref.hbdr_ready, false);
+    g_loggedHbdrFound = false;
+    g_loggedHbdrWritable = false;
+    g_loggedHbdrTypes = false;
+    g_loggedStartupSummary = false;
+    g_commReadyKnown = false;
+    g_lastCommReady = false;
+    g_pollModeKnown = false;
+    g_lastFastPoll = false;
+    g_logonKnown = false;
+    g_logonAvailable = false;
+    g_lastCallsign.clear();
     SetStatus("DISABLED");
     Log(LOG_INFO, "Disabled");
 }

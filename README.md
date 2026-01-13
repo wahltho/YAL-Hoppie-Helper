@@ -23,6 +23,7 @@ Requirements:
 - Reuse build directories; only rerun `cmake -S ...` when CMake/toolchain settings change.
 - Quick rebuilds: `cmake --build build-<plat> --config Release`
 - If Ninja is available, add `-G Ninja` on macOS/Linux for faster incremental builds.
+- For container cross-compiles, keep the same mount path (e.g. `/workspace`) and reuse the same `build-win*` directory to avoid CMake cache path mismatches.
 - For container builds, create a local image once to avoid `apt-get` on every run:
 ```bash
 podman build -t yal-xplane-build - <<'EOF'
@@ -48,10 +49,11 @@ Result: `build-mac/mac.xpl` or `build-mac-universal/mac.xpl`.
 - Podman or Docker with an Ubuntu image.
 - If the SDK lives next to the repo (`../SDKs/XPlane_SDK`), mount it into the container.
 - On Apple Silicon, use `--platform=linux/amd64` (X-Plane Linux is x86_64).
+- Keep the same container mount path (e.g. `/workspace`) when reusing `build-lin*` to avoid CMake cache path mismatches.
 ```bash
 podman machine start   # once (if using Podman)
 podman run --rm -it --platform=linux/amd64 \
-  -v "$(pwd)":/work -v "$(pwd)/../SDKs":/SDKs -w /work ubuntu:22.04 bash -lc "\
+  -v "$(pwd)":/workspace -v "$(pwd)/../SDKs":/SDKs -w /workspace ubuntu:22.04 bash -lc "\
   apt-get update && apt-get install -y build-essential cmake ninja-build libcurl4-openssl-dev && \
   cmake -S . -B build-lin -G Ninja -DCMAKE_BUILD_TYPE=Release -DXPLANE_SDK_PATH=/SDKs/XPlane_SDK && \
   cmake --build build-lin"
@@ -69,9 +71,10 @@ Result: `build-win/Release/win.xpl`.
 
 ### Windows (Cross-Compile via Container, optional)
 - For CI or macOS/Linux hosts: use `mingw-w64` in an Ubuntu container.
+- Keep the same container mount path (e.g. `/workspace`) when reusing `build-win*` to avoid CMake cache path mismatches.
 ```bash
 podman run --rm -it --platform=linux/amd64 \
-  -v "$(pwd)":/work -v "$(pwd)/../SDKs":/SDKs -w /work ubuntu:22.04 bash -lc "\
+  -v "$(pwd)":/workspace -v "$(pwd)/../SDKs":/SDKs -w /workspace ubuntu:22.04 bash -lc "\
   apt-get update && apt-get install -y cmake ninja-build mingw-w64 && \
   cmake -S . -B build-win -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_SYSTEM_NAME=Windows \
@@ -81,6 +84,13 @@ podman run --rm -it --platform=linux/amd64 \
   cmake --build build-win"
 ```
 Result: `build-win/win.xpl` (Ninja).
+
+Quick rebuild (already configured in container; reuse the same build directory, e.g. `build-win2`):
+```bash
+podman run --rm -it --platform=linux/amd64 \
+  -v "$(pwd)":/workspace -v "$(pwd)/../SDKs":/SDKs -w /workspace ubuntu:22.04 bash -lc "\
+  cmake --build build-win"
+```
 
 ### Staging / Packaging
 ```bash
@@ -118,6 +128,7 @@ X-Plane 12/
 - The helper reads the Hoppie logon from `YAL/hoppie/logon`.
 - The FMC provides the callsign via `hoppiebridge/send_callsign`.
 - The helper sets `hoppiebridge/comm_ready` and `laminar/B738/HBDR_ready`.
+- Polling defaults to a randomized 45-75 second interval; set `hoppiebridge/poll_frequency_fast` to a non-zero value for ~12-18 second polling.
 - Plugin signature (ID): `yal.hoppiehelper`
 - Current plugin version: 1.0.0
 

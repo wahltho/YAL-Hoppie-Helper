@@ -36,9 +36,11 @@
 *.exe
 *.out
 *.app
+*.xpl
 
 # debug information files
 *.dwo
 .DS_Store
 build-*/
 build*/
+deploy/
