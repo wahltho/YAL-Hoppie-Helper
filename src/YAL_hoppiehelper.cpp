@@ -20,6 +20,7 @@
 #include <mutex>
 #include <queue>
 #include <random>
+#include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -195,7 +196,6 @@ void LogCallsignState(const std::string& callsign, bool justSet);
 void LogCommReadyState(bool ready);
 void LogPollModeChange();
 void LogLogonState(const std::string& logon);
-std::string TrimOuterBraces(std::string value);
 bool IsZiboPluginLoaded();
 bool IsZiboTailnum(const std::string& tailnum);
 bool UpdateZiboState();
@@ -257,14 +257,6 @@ std::string Trim(const std::string& s) {
         --end;
     }
     return s.substr(start, end - start);
-}
-
-std::string TrimOuterBraces(std::string value) {
-    value = Trim(value);
-    while (value.size() >= 2 && value.front() == '{' && value.back() == '}') {
-        value = Trim(value.substr(1, value.size() - 2));
-    }
-    return value;
 }
 
 bool IsZiboPluginLoaded() {
@@ -938,47 +930,32 @@ HttpResult RunHttpJob(const HttpJob& job) {
     return result;
 }
 
-bool ParseOkPayload(const std::string& raw, std::string* from, std::string* type, std::string* packet) {
+bool ParseHoppiePayload(const std::string& raw, std::string* from, std::string* type, std::string* packet) {
     std::string s = Trim(raw);
     if (s.empty()) {
         return false;
     }
-    if (s.rfind("ok", 0) != 0) {
-        return false;
+    if (s == "ok") {
+        if (from) from->clear();
+        if (type) type->clear();
+        if (packet) *packet = "ok";
+        return true;
     }
-    size_t brace = s.find('{');
-    if (brace == std::string::npos) {
-        return false;
+    static const std::regex kHoppiePattern(R"(\{([^\s]+)\s+([^\s]+)\s+\{([\s\S]+?)\}\})");
+    std::smatch match;
+    if (std::regex_search(s, match, kHoppiePattern)) {
+        if (from) *from = match[1].str();
+        if (type) *type = match[2].str();
+        if (packet) *packet = Trim(match[3].str());
+        return true;
     }
-    size_t last = s.rfind('}');
-    if (last == std::string::npos || last <= brace) {
-        return false;
-    }
-    std::string inner = s.substr(brace + 1, last - brace - 1);
-    std::istringstream iss(inner);
-    std::string src;
-    std::string msgType;
-    if (!(iss >> src >> msgType)) {
-        return false;
-    }
-    std::string rest;
-    std::getline(iss, rest);
-    rest = Trim(rest);
-    std::string pkt;
-    size_t open = rest.find('{');
-    size_t close = rest.rfind('}');
-    if (open != std::string::npos && close != std::string::npos && close > open) {
-        pkt = rest.substr(open + 1, close - open - 1);
-    } else {
-        pkt = rest;
-    }
-    if (from) *from = src;
-    if (type) *type = msgType;
-    if (packet) *packet = Trim(pkt);
+    if (from) from->clear();
+    if (type) type->clear();
+    if (packet) *packet = s;
     return true;
 }
 
-bool IsPollOkOnly(const std::string& raw) {
+bool IsOkOnlyCaseInsensitive(const std::string& raw) {
     std::string s = Trim(raw);
     if (s.size() != 2) {
         return false;
@@ -998,25 +975,14 @@ bool BuildInboundMessage(const std::string& origin, const std::string& raw, Inbo
     std::string from;
     std::string type;
     std::string packet;
-    if (!ParseOkPayload(trimmed, &from, &type, &packet)) {
-        if (IsPollOkOnly(trimmed)) {
-            return false;
-        }
-        packet = trimmed;
+    if (!ParseHoppiePayload(trimmed, &from, &type, &packet)) {
+        return false;
     }
     if (out) {
         out->origin = origin;
         out->raw = trimmed;
         out->from = from;
         out->type = type;
-        if (!type.empty()) {
-            std::string lower = type;
-            std::transform(lower.begin(), lower.end(), lower.begin(),
-                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
-            if (lower == "info") {
-                packet = TrimOuterBraces(packet);
-            }
-        }
         out->packet = packet;
     }
     return true;
@@ -1135,20 +1101,22 @@ void DrainResults(bool allowDelivery) {
             g_pollPending = false;
             double now = XPLMGetElapsedTime();
             if (res.ok) {
-                if (IsPollOkOnly(res.response)) {
+                bool okOnly = IsOkOnlyCaseInsensitive(res.response);
+                bool wasCommEstablished = g_commEstablished;
+                if (okOnly) {
                     if (!g_commEstablished) {
                         Log(LOG_INFO, "Poll ok. Communication ready.");
                     }
                     g_commEstablished = true;
                 }
-                QueueInboundMessage("poll", res.response);
+                if (!okOnly || wasCommEstablished) {
+                    QueueInboundMessage("poll", res.response);
+                }
                 SetLastError("");
                 SetLastHttp("poll: " + std::to_string(res.httpCode));
-                ScheduleNextPollTime(now);
             } else {
                 SetLastError("Poll failed: " + res.error);
                 SetLastHttp("poll: " + std::to_string(res.httpCode));
-                ScheduleNextPollTime(now);
             }
         }
     }
@@ -1250,7 +1218,9 @@ float FlightLoopCallback(float, float, int, void*) {
     LogPollModeChange();
     bool prereqsOk = AreCommPrereqsReady(logon, callsign, nullptr);
 
-    if (commReady && !g_sendPending) {
+    bool jobPending = g_sendPending || g_pollPending;
+
+    if (!jobPending && commReady) {
         std::string to = Trim(GetDataRefString(g_dref.send_message_to));
         std::string type = Trim(GetDataRefString(g_dref.send_message_type));
         std::string packet = Trim(GetDataRefString(g_dref.send_message_packet));
@@ -1264,10 +1234,12 @@ float FlightLoopCallback(float, float, int, void*) {
             job.packet = packet;
             EnqueueJob(job);
             g_sendPending = true;
+            jobPending = true;
+            ScheduleNextPollTime(now);
         }
     }
 
-    if (prereqsOk && !g_pollPending && (!commReady || now >= g_nextPollTime)) {
+    if (!jobPending && prereqsOk && (!commReady || now >= g_nextPollTime)) {
         HttpJob job;
         job.type = JobType::Poll;
         job.logon = logon;
@@ -1276,6 +1248,7 @@ float FlightLoopCallback(float, float, int, void*) {
         job.msg_type = "poll";
         EnqueueJob(job);
         g_pollPending = true;
+        ScheduleNextPollTime(now);
     }
 
     return kFlightLoopInterval;
@@ -1369,7 +1342,7 @@ void RefreshDataRefs(double now) {
     g_nextRefScanTime = now + 2.0;
 
     if (g_refsReady) {
-        ScheduleNextPollTime(now);
+        g_nextPollTime = 0.0;
         g_loggedMissingRefs = false;
         Log(LOG_INFO, "Required datarefs found. Helper ready.");
         LogReadySummary();
@@ -1408,7 +1381,7 @@ PLUGIN_API int XPluginEnable() {
     g_worker = std::thread(WorkerLoop);
     EnsureHoppieDataRefs();
     FindDataRefs();
-    ScheduleNextPollTime(XPLMGetElapsedTime());
+    g_nextPollTime = 0.0;
     g_refsReady = HasCoreDataRefs();
     g_loggedMissingRefs = false;
     g_nextRefScanTime = 0.0;
