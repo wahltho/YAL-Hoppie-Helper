@@ -16,6 +16,7 @@
 #include <cstring>
 #include <condition_variable>
 #include <cctype>
+#include <deque>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -32,6 +33,7 @@ constexpr const char* kPluginSig = "yal.hoppiehelper";
 constexpr const char* kPluginVersion = "1.0.0";
 constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.0.0";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
+constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
 constexpr float kFlightLoopInterval = 1.0f;
 constexpr int kPollDefaultMinSeconds = 45;
@@ -63,6 +65,7 @@ struct DataRefs {
     XPLMDataRef poll_count = nullptr;
     XPLMDataRef hbdr_ready = nullptr;
     XPLMDataRef avionics_on = nullptr;
+    XPLMDataRef tailnum = nullptr;
 };
 
 constexpr int kNumberDataRefTypes = xplmType_Int | xplmType_Float | xplmType_Double;
@@ -121,12 +124,21 @@ struct HttpResult {
     long httpCode = 0;
 };
 
+struct InboundMessage {
+    std::string origin;
+    std::string raw;
+    std::string from;
+    std::string type;
+    std::string packet;
+};
+
 std::mutex g_mutex;
 std::condition_variable g_cv;
 std::queue<HttpJob> g_jobs;
 std::queue<HttpResult> g_results;
 std::mutex g_ownedMutex;
 std::mt19937 g_rng{std::random_device{}()};
+std::deque<InboundMessage> g_pendingInbox;
 
 bool g_sendPending = false;
 bool g_pollPending = false;
@@ -148,6 +160,13 @@ bool g_logonAvailable = false;
 std::string g_lastCallsign;
 double g_nextRefScanTime = 0.0;
 bool g_commEstablished = false;
+bool g_ziboKnown = false;
+bool g_lastZiboReady = false;
+bool g_ziboPluginKnown = false;
+bool g_lastZiboPluginPresent = false;
+bool g_tailnumKnown = false;
+bool g_lastTailnumMatches = false;
+std::string g_lastTailnum;
 
 enum LogLevel { LOG_ERR = 1, LOG_INFO = 2, LOG_DBG = 3 };
 
@@ -166,7 +185,7 @@ int GetDatabCB(void* refcon, void* outValue, int offset, int max);
 void SetDatabCB(void* refcon, void* inValue, int offset, int max);
 bool HasCoreDataRefs();
 void RefreshDataRefs(double now);
-void RefreshHbdrReady();
+void RefreshHbdrReady(bool allowReady);
 void EnsureHoppieDataRefs();
 void UnregisterHoppieDataRefs();
 double NextPollIntervalSeconds(bool fastPoll);
@@ -176,6 +195,16 @@ void LogCallsignState(const std::string& callsign, bool justSet);
 void LogCommReadyState(bool ready);
 void LogPollModeChange();
 void LogLogonState(const std::string& logon);
+std::string TrimOuterBraces(std::string value);
+bool IsZiboPluginLoaded();
+bool IsZiboTailnum(const std::string& tailnum);
+bool UpdateZiboState();
+void ResetOperationalState(double now);
+bool InboxHasMessage();
+bool BuildInboundMessage(const std::string& origin, const std::string& raw, InboundMessage* out);
+void ApplyInboxMessage(const InboundMessage& msg);
+void QueueInboundMessage(const std::string& origin, const std::string& raw);
+void DeliverQueuedInboxIfEmpty();
 
 void Log(LogLevel level, const std::string& msg) {
     if (g_debugLevel < level) {
@@ -228,6 +257,93 @@ std::string Trim(const std::string& s) {
         --end;
     }
     return s.substr(start, end - start);
+}
+
+std::string TrimOuterBraces(std::string value) {
+    value = Trim(value);
+    while (value.size() >= 2 && value.front() == '{' && value.back() == '}') {
+        value = Trim(value.substr(1, value.size() - 2));
+    }
+    return value;
+}
+
+bool IsZiboPluginLoaded() {
+    return XPLMFindPluginBySignature(kZiboPluginSig) != XPLM_NO_PLUGIN_ID;
+}
+
+bool IsZiboTailnum(const std::string& tailnum) {
+    if (tailnum.empty()) {
+        return false;
+    }
+    std::string prefix5 = tailnum.substr(0, std::min<size_t>(5, tailnum.size()));
+    if (prefix5 == "ZB738") {
+        return true;
+    }
+    std::string prefix4 = tailnum.substr(0, std::min<size_t>(4, tailnum.size()));
+    return prefix4 == "B736" || prefix4 == "B737" || prefix4 == "B739" || prefix4 == "738";
+}
+
+bool UpdateZiboState() {
+    if (!g_dref.tailnum) {
+        g_dref.tailnum = XPLMFindDataRef("sim/aircraft/view/acf_tailnum");
+    }
+    bool pluginPresent = IsZiboPluginLoaded();
+    std::string tailnum = Trim(GetDataRefString(g_dref.tailnum));
+    bool tailnumOk = IsZiboTailnum(tailnum);
+    bool ready = pluginPresent && tailnumOk;
+
+    if (!g_ziboPluginKnown || pluginPresent != g_lastZiboPluginPresent) {
+        g_ziboPluginKnown = true;
+        g_lastZiboPluginPresent = pluginPresent;
+        Log(LOG_DBG, std::string("Zibo plugin ") + (pluginPresent ? "detected." : "not found."));
+    }
+
+    if (!g_tailnumKnown || tailnum != g_lastTailnum) {
+        g_tailnumKnown = true;
+        g_lastTailnum = tailnum;
+        Log(LOG_DBG, std::string("Tailnum: ") + (tailnum.empty() ? "-" : tailnum));
+    }
+    if (g_lastTailnumMatches != tailnumOk) {
+        g_lastTailnumMatches = tailnumOk;
+        Log(LOG_DBG, std::string("Tailnum match: ") + (tailnumOk ? "yes" : "no") + ".");
+    }
+
+    if (!g_ziboKnown || ready != g_lastZiboReady) {
+        g_ziboKnown = true;
+        g_lastZiboReady = ready;
+        if (ready) {
+            Log(LOG_INFO, std::string("Zibo ready (tailnum=")
+                + (tailnum.empty() ? "-" : tailnum) + ").");
+        } else if (!pluginPresent) {
+            Log(LOG_INFO, "Zibo not ready (plugin missing).");
+        } else if (!tailnumOk) {
+            Log(LOG_INFO, std::string("Zibo not ready (tailnum=")
+                + (tailnum.empty() ? "-" : tailnum) + ").");
+        } else {
+            Log(LOG_INFO, "Zibo not ready.");
+        }
+    }
+
+    return ready;
+}
+
+void ResetOperationalState(double now) {
+    g_refsReady = false;
+    g_nextRefScanTime = now;
+    g_commEstablished = false;
+    g_sendPending = false;
+    g_pollPending = false;
+    SetDataRefBool(g_dref.comm_ready, false);
+    g_loggedMissingRefs = false;
+    g_loggedStartupSummary = false;
+    g_commReadyKnown = false;
+    g_lastCommReady = false;
+    g_pollModeKnown = false;
+    g_lastFastPoll = false;
+    g_logonKnown = false;
+    g_logonAvailable = false;
+    g_lastCallsign.clear();
+    g_pendingInbox.clear();
 }
 
 std::string UrlEncode(const std::string& input) {
@@ -870,6 +986,82 @@ bool IsPollOkOnly(const std::string& raw) {
     return (s[0] == 'o' || s[0] == 'O') && (s[1] == 'k' || s[1] == 'K');
 }
 
+bool InboxHasMessage() {
+    return !Trim(GetDataRefString(g_dref.poll_queue)).empty();
+}
+
+bool BuildInboundMessage(const std::string& origin, const std::string& raw, InboundMessage* out) {
+    std::string trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return false;
+    }
+    std::string from;
+    std::string type;
+    std::string packet;
+    if (!ParseOkPayload(trimmed, &from, &type, &packet)) {
+        if (IsPollOkOnly(trimmed)) {
+            return false;
+        }
+        packet = trimmed;
+    }
+    if (out) {
+        out->origin = origin;
+        out->raw = trimmed;
+        out->from = from;
+        out->type = type;
+        if (!type.empty()) {
+            std::string lower = type;
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (lower == "info") {
+                packet = TrimOuterBraces(packet);
+            }
+        }
+        out->packet = packet;
+    }
+    return true;
+}
+
+void ApplyInboxMessage(const InboundMessage& msg) {
+    SetDataRefString(g_dref.poll_message_origin, msg.origin);
+    SetDataRefString(g_dref.poll_message_from, msg.from);
+    SetDataRefString(g_dref.poll_message_type, msg.type);
+    SetDataRefString(g_dref.poll_message_packet, msg.packet);
+    SetDataRefString(g_dref.poll_queue, std::string("{\"") + msg.origin + "\":\"" + JsonEscape(msg.raw) + "\"}");
+    SetDataRefBool(g_dref.poll_queue_clear, false);
+    if (g_dref.poll_count) {
+        XPLMSetDatai(g_dref.poll_count, XPLMGetDatai(g_dref.poll_count) + 1);
+    }
+    std::string label = msg.origin == "response" ? "Response" : "Poll";
+    if (!msg.from.empty() || !msg.type.empty()) {
+        Log(LOG_INFO, label + " message from " + msg.from + " type " + msg.type);
+    } else {
+        Log(LOG_INFO, label + " message received.");
+    }
+}
+
+void QueueInboundMessage(const std::string& origin, const std::string& raw) {
+    InboundMessage msg;
+    if (!BuildInboundMessage(origin, raw, &msg)) {
+        return;
+    }
+    if (InboxHasMessage()) {
+        g_pendingInbox.push_back(std::move(msg));
+        Log(LOG_INFO, "Inbox busy; queued " + origin + " message.");
+        return;
+    }
+    ApplyInboxMessage(msg);
+}
+
+void DeliverQueuedInboxIfEmpty() {
+    if (InboxHasMessage() || g_pendingInbox.empty()) {
+        return;
+    }
+    InboundMessage msg = std::move(g_pendingInbox.front());
+    g_pendingInbox.pop_front();
+    ApplyInboxMessage(msg);
+}
+
 bool AreCommPrereqsReady(const std::string& logon, const std::string& callsign, bool* avionicsOkOut) {
     bool avionicsOk = true;
     if (g_dref.avionics_on) {
@@ -907,7 +1099,7 @@ void EnqueueJob(const HttpJob& job) {
     g_cv.notify_one();
 }
 
-void DrainResults() {
+void DrainResults(bool allowDelivery) {
     std::queue<HttpResult> results;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -916,6 +1108,11 @@ void DrainResults() {
     while (!results.empty()) {
         HttpResult res = results.front();
         results.pop();
+        if (!allowDelivery) {
+            g_sendPending = false;
+            g_pollPending = false;
+            continue;
+        }
         if (res.type == JobType::Send) {
             g_sendPending = false;
             if (res.ok) {
@@ -929,6 +1126,7 @@ void DrainResults() {
                 SetLastError("");
                 SetLastHttp("send: " + std::to_string(res.httpCode));
                 Log(LOG_INFO, "Send ok: " + Trim(res.response));
+                QueueInboundMessage("response", res.response);
             } else {
                 SetLastError("Send failed: " + res.error);
                 SetLastHttp("send: " + std::to_string(res.httpCode));
@@ -943,21 +1141,7 @@ void DrainResults() {
                     }
                     g_commEstablished = true;
                 }
-                std::string from;
-                std::string type;
-                std::string packet;
-                if (ParseOkPayload(res.response, &from, &type, &packet)) {
-                    SetDataRefString(g_dref.poll_message_origin, "poll");
-                    SetDataRefString(g_dref.poll_message_from, from);
-                    SetDataRefString(g_dref.poll_message_type, type);
-                    SetDataRefString(g_dref.poll_message_packet, packet);
-                    SetDataRefString(g_dref.poll_queue, std::string("{\"poll\":\"") + JsonEscape(res.response) + "\"}");
-                    SetDataRefBool(g_dref.poll_queue_clear, false);
-                    if (g_dref.poll_count) {
-                        XPLMSetDatai(g_dref.poll_count, XPLMGetDatai(g_dref.poll_count) + 1);
-                    }
-                    Log(LOG_INFO, "Poll message from " + from + " type " + type);
-                }
+                QueueInboundMessage("poll", res.response);
                 SetLastError("");
                 SetLastHttp("poll: " + std::to_string(res.httpCode));
                 ScheduleNextPollTime(now);
@@ -1027,13 +1211,30 @@ float FlightLoopCallback(float, float, int, void*) {
     g_debugLevel = GetDebugLevel();
 
     double now = XPLMGetElapsedTime();
-    RefreshDataRefs(now);
-    if (!g_refsReady) {
+    bool ziboReady = UpdateZiboState();
+    if (!ziboReady) {
+        if (g_refsReady || g_commEstablished || g_sendPending || g_pollPending || !g_pendingInbox.empty()) {
+            ResetOperationalState(now);
+        }
+        RefreshHbdrReady(false);
+        DrainResults(false);
+        SetDataRefBool(g_dref.comm_ready, false);
+        SetStatus("WAIT_ZIBO");
         return kFlightLoopInterval;
     }
 
-    DrainResults();
+    RefreshDataRefs(now);
+    RefreshHbdrReady(g_refsReady);
+    if (!g_refsReady) {
+        DrainResults(false);
+        SetDataRefBool(g_dref.comm_ready, false);
+        SetStatus("WAIT_YAL");
+        return kFlightLoopInterval;
+    }
+
+    DrainResults(true);
     ClearInboxIfRequested();
+    DeliverQueuedInboxIfEmpty();
 
     std::string logon = Trim(GetDataRefString(g_dref.logon));
     std::string callsign = Trim(GetDataRefString(g_dref.callsign));
@@ -1067,17 +1268,14 @@ float FlightLoopCallback(float, float, int, void*) {
     }
 
     if (prereqsOk && !g_pollPending && (!commReady || now >= g_nextPollTime)) {
-        std::string existing = Trim(GetDataRefString(g_dref.poll_message_packet));
-        if (existing.empty()) {
-            HttpJob job;
-            job.type = JobType::Poll;
-            job.logon = logon;
-            job.from = callsign;
-            job.to = callsign;
-            job.msg_type = "poll";
-            EnqueueJob(job);
-            g_pollPending = true;
-        }
+        HttpJob job;
+        job.type = JobType::Poll;
+        job.logon = logon;
+        job.from = callsign;
+        job.to = callsign;
+        job.msg_type = "poll";
+        EnqueueJob(job);
+        g_pollPending = true;
     }
 
     return kFlightLoopInterval;
@@ -1107,6 +1305,7 @@ void FindDataRefs() {
     g_dref.poll_count = XPLMFindDataRef("YAL/hoppie/poll_count");
     g_dref.hbdr_ready = XPLMFindDataRef("laminar/B738/HBDR_ready");
     g_dref.avionics_on = XPLMFindDataRef("sim/cockpit/electrical/avionics_on");
+    g_dref.tailnum = XPLMFindDataRef("sim/aircraft/view/acf_tailnum");
 
     if (!g_dref.logon) {
         Log(LOG_DBG, "Missing dataref: YAL/hoppie/logon");
@@ -1125,16 +1324,20 @@ bool HasCoreDataRefs() {
         && g_dref.send_callsign;
 }
 
-void RefreshHbdrReady() {
-    if (!g_dref.hbdr_ready) {
-        g_dref.hbdr_ready = XPLMFindDataRef("laminar/B738/HBDR_ready");
-        if (g_dref.hbdr_ready && !g_loggedHbdrFound) {
-            g_loggedHbdrFound = true;
-            Log(LOG_INFO, "Found HBDR_ready dataref.");
-        }
+void RefreshHbdrReady(bool allowReady) {
+    XPLMDataRef ref = XPLMFindDataRef("laminar/B738/HBDR_ready");
+    if (ref != g_dref.hbdr_ready) {
+        g_dref.hbdr_ready = ref;
+        g_loggedHbdrFound = false;
+        g_loggedHbdrWritable = false;
+        g_loggedHbdrTypes = false;
     }
     if (!g_dref.hbdr_ready) {
         return;
+    }
+    if (!g_loggedHbdrFound) {
+        g_loggedHbdrFound = true;
+        Log(LOG_INFO, "Found HBDR_ready dataref.");
     }
     if (!g_loggedHbdrTypes) {
         g_loggedHbdrTypes = true;
@@ -1144,25 +1347,13 @@ void RefreshHbdrReady() {
         g_loggedHbdrWritable = true;
         Log(LOG_ERR, "HBDR_ready dataref is not writable.");
     }
-    SetDataRefBool(g_dref.hbdr_ready, true);
+    SetDataRefBool(g_dref.hbdr_ready, allowReady);
 }
 
 void RefreshDataRefs(double now) {
-    RefreshHbdrReady();
     if (g_refsReady) {
         if (!HasCoreDataRefs()) {
-            g_refsReady = false;
-            g_nextRefScanTime = now;
-            g_commEstablished = false;
-            SetDataRefBool(g_dref.comm_ready, false);
-            g_loggedStartupSummary = false;
-            g_commReadyKnown = false;
-            g_lastCommReady = false;
-            g_pollModeKnown = false;
-            g_lastFastPoll = false;
-            g_logonKnown = false;
-            g_logonAvailable = false;
-            g_lastCallsign.clear();
+            ResetOperationalState(now);
             Log(LOG_ERR, "Lost required datarefs. Will retry.");
         }
         return;
@@ -1229,6 +1420,14 @@ PLUGIN_API int XPluginEnable() {
     g_logonKnown = false;
     g_logonAvailable = false;
     g_lastCallsign.clear();
+    g_pendingInbox.clear();
+    g_ziboKnown = false;
+    g_lastZiboReady = false;
+    g_ziboPluginKnown = false;
+    g_lastZiboPluginPresent = false;
+    g_tailnumKnown = false;
+    g_lastTailnumMatches = false;
+    g_lastTailnum.clear();
     if (!g_refsReady) {
         g_loggedMissingRefs = true;
         Log(LOG_INFO, "Waiting for YAL datarefs...");
@@ -1236,7 +1435,7 @@ PLUGIN_API int XPluginEnable() {
         Log(LOG_INFO, "Required datarefs found. Helper ready.");
         LogReadySummary();
     }
-    RefreshHbdrReady();
+    RefreshHbdrReady(g_refsReady);
     XPLMRegisterFlightLoopCallback(FlightLoopCallback, kFlightLoopInterval, nullptr);
     g_commEstablished = false;
     SetDataRefBool(g_dref.comm_ready, false);
@@ -1274,6 +1473,14 @@ PLUGIN_API void XPluginDisable() {
     g_logonKnown = false;
     g_logonAvailable = false;
     g_lastCallsign.clear();
+    g_pendingInbox.clear();
+    g_ziboKnown = false;
+    g_lastZiboReady = false;
+    g_ziboPluginKnown = false;
+    g_lastZiboPluginPresent = false;
+    g_tailnumKnown = false;
+    g_lastTailnumMatches = false;
+    g_lastTailnum.clear();
     SetStatus("DISABLED");
     Log(LOG_INFO, "Disabled");
 }
