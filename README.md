@@ -1,4 +1,4 @@
-# YAL_hoppiehelper (C++)
+# YAL Hoppie Helper (C++)
 
 This helper provides the HTTP POST layer for Hoppie ACARS and feeds the
 `hoppiebridge/*` datarefs required by the Zibo FMC. YAL stays functional
