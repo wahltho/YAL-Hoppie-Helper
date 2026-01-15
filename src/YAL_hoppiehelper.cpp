@@ -33,8 +33,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "1.0.0";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.0.0";
+constexpr const char* kPluginVersion = "1.2";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.2";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 

@@ -151,7 +151,7 @@ Remove the file to disable autark mode. Zibo tailnum gating still applies.
 - The helper sets `hoppiebridge/comm_ready` and `laminar/B738/HBDR_ready`.
 - Polling defaults to a randomized 45-75 second interval; set `hoppiebridge/poll_frequency_fast` to a non-zero value for ~12-18 second polling.
 - Plugin signature (ID): `yal.hoppiehelper`
-- Current plugin version: 1.0.0
+- Current plugin version: 1.2
 
 ## Debug Datarefs
 
