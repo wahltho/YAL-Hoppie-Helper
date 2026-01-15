@@ -123,9 +123,30 @@ X-Plane 12/
           lin.xpl  (Linux)
 ```
 
+## Autark Mode (optional)
+
+Autark mode is enabled when the file `Output/preferences/YAL_HoppieHelper.prf` exists.
+When enabled, the helper ignores YAL logon/debug datarefs and uses values from the file.
+
+Supported keys:
+- `logon=` (required for autark)
+- `debug_level=` (0-3, optional)
+- `poll_fast=` (optional; forces fast polling when truthy)
+- `callsign=` (optional; applied if empty or previously set by prefs)
+
+Example:
+```
+logon=YOURHOPPIELOGON
+debug_level=2
+poll_fast=1
+callsign=DLH123
+```
+
+Remove the file to disable autark mode. Zibo tailnum gating still applies.
+
 ## Notes
 
-- The helper reads the Hoppie logon from `YAL/hoppie/logon`.
+- The helper reads the Hoppie logon from `YAL/hoppie/logon` unless autark mode is enabled.
 - The FMC provides the callsign via `hoppiebridge/send_callsign`.
 - The helper sets `hoppiebridge/comm_ready` and `laminar/B738/HBDR_ready`.
 - Polling defaults to a randomized 45-75 second interval; set `hoppiebridge/poll_frequency_fast` to a non-zero value for ~12-18 second polling.

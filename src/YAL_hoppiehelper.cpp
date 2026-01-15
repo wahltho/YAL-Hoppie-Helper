@@ -13,10 +13,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <condition_variable>
 #include <cctype>
 #include <deque>
+#include <fstream>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -169,6 +171,31 @@ bool g_tailnumKnown = false;
 bool g_lastTailnumMatches = false;
 std::string g_lastTailnum;
 
+struct AutarkConfig {
+    bool enabled = false;
+    bool hasLogon = false;
+    std::string logon;
+    bool hasDebug = false;
+    int debugLevel = 1;
+    bool hasPollFast = false;
+    bool pollFast = false;
+    bool hasCallsign = false;
+    std::string callsign;
+};
+
+struct AutarkUpdate {
+    bool modeChanged = false;
+    bool logonChanged = false;
+    bool debugChanged = false;
+    bool pollFastChanged = false;
+    bool callsignChanged = false;
+};
+
+bool g_autarkMode = false;
+AutarkConfig g_autarkConfig;
+std::string g_autarkAppliedCallsign;
+double g_nextPrefScanTime = 0.0;
+
 enum LogLevel { LOG_ERR = 1, LOG_INFO = 2, LOG_DBG = 3 };
 
 std::string GetDataRefString(XPLMDataRef dr);
@@ -189,6 +216,10 @@ void RefreshDataRefs(double now);
 void RefreshHbdrReady(bool allowReady);
 void EnsureHoppieDataRefs();
 void UnregisterHoppieDataRefs();
+AutarkUpdate UpdateAutarkConfig(double now);
+std::string GetActiveLogon();
+bool ApplyAutarkCallsign(std::string* callsign);
+void ApplyAutarkPollFastOverride();
 double NextPollIntervalSeconds(bool fastPoll);
 void ScheduleNextPollTime(double now);
 void LogReadySummary();
@@ -238,6 +269,15 @@ void SetLastHttp(const std::string& info) {
 }
 
 int GetDebugLevel() {
+    if (g_autarkMode) {
+        if (g_autarkConfig.hasDebug) {
+            int level = g_autarkConfig.debugLevel;
+            if (level < 0) level = 0;
+            if (level > 3) level = 3;
+            return level;
+        }
+        return 1;
+    }
     if (!g_dref.debug_level) {
         return 1;
     }
@@ -257,6 +297,227 @@ std::string Trim(const std::string& s) {
         --end;
     }
     return s.substr(start, end - start);
+}
+
+std::string ToLower(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        out.push_back(static_cast<char>(std::tolower(c)));
+    }
+    return out;
+}
+
+std::string StripQuotes(const std::string& s) {
+    if (s.size() < 2) {
+        return s;
+    }
+    char front = s.front();
+    char back = s.back();
+    if ((front == '"' && back == '"') || (front == '\'' && back == '\'')) {
+        return s.substr(1, s.size() - 2);
+    }
+    return s;
+}
+
+bool ParseInt(const std::string& s, int* out) {
+    if (!out) {
+        return false;
+    }
+    char* end = nullptr;
+    long value = std::strtol(s.c_str(), &end, 10);
+    if (!end || end == s.c_str()) {
+        return false;
+    }
+    *out = static_cast<int>(value);
+    return true;
+}
+
+bool ParseBool(const std::string& s, bool* out) {
+    if (!out) {
+        return false;
+    }
+    std::string lower = ToLower(Trim(s));
+    if (lower.empty()) {
+        return false;
+    }
+    if (lower == "1" || lower == "true" || lower == "yes" || lower == "on") {
+        *out = true;
+        return true;
+    }
+    if (lower == "0" || lower == "false" || lower == "no" || lower == "off") {
+        *out = false;
+        return true;
+    }
+    int value = 0;
+    if (ParseInt(lower, &value)) {
+        *out = value != 0;
+        return true;
+    }
+    return false;
+}
+
+std::string GetPrefsDir() {
+    char path[512] = {};
+    XPLMGetPrefsPath(path);
+    std::string full(path);
+    if (full.empty()) {
+        return "";
+    }
+    size_t pos = full.find_last_of("/\\");
+    if (pos == std::string::npos) {
+        return "";
+    }
+    return full.substr(0, pos);
+}
+
+std::string GetAutarkPrefPath() {
+    std::string dir = GetPrefsDir();
+    if (dir.empty()) {
+        return "";
+    }
+    return dir + "/YAL_HoppieHelper.prf";
+}
+
+bool LoadAutarkConfig(AutarkConfig* out) {
+    if (!out) {
+        return false;
+    }
+    *out = AutarkConfig{};
+    std::string path = GetAutarkPrefPath();
+    if (path.empty()) {
+        return false;
+    }
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return false;
+    }
+    out->enabled = true;
+    std::string line;
+    while (std::getline(file, line)) {
+        std::string trimmed = Trim(line);
+        if (trimmed.empty()) {
+            continue;
+        }
+        if (trimmed[0] == '#' || trimmed[0] == ';') {
+            continue;
+        }
+        size_t eq = trimmed.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        std::string key = Trim(trimmed.substr(0, eq));
+        std::string value = Trim(trimmed.substr(eq + 1));
+        value = StripQuotes(value);
+        std::string keyLower = ToLower(key);
+        if (keyLower == "logon") {
+            out->hasLogon = true;
+            out->logon = Trim(value);
+        } else if (keyLower == "debug_level") {
+            int level = 0;
+            if (ParseInt(value, &level)) {
+                if (level < 0) level = 0;
+                if (level > 3) level = 3;
+                out->hasDebug = true;
+                out->debugLevel = level;
+            }
+        } else if (keyLower == "poll_fast") {
+            bool enabled = false;
+            if (ParseBool(value, &enabled)) {
+                out->hasPollFast = true;
+                out->pollFast = enabled;
+            }
+        } else if (keyLower == "callsign") {
+            out->hasCallsign = true;
+            out->callsign = Trim(value);
+        }
+    }
+    return true;
+}
+
+AutarkUpdate UpdateAutarkConfig(double now) {
+    AutarkUpdate update;
+    if (now < g_nextPrefScanTime) {
+        return update;
+    }
+    g_nextPrefScanTime = now + 2.0;
+
+    AutarkConfig loaded;
+    bool enabled = LoadAutarkConfig(&loaded);
+    if (enabled != g_autarkMode) {
+        update.modeChanged = true;
+    }
+
+    if (enabled) {
+        const AutarkConfig& prev = g_autarkConfig;
+        if (!g_autarkMode || prev.hasLogon != loaded.hasLogon || prev.logon != loaded.logon) {
+            update.logonChanged = true;
+        }
+        if (!g_autarkMode || prev.hasDebug != loaded.hasDebug || prev.debugLevel != loaded.debugLevel) {
+            update.debugChanged = true;
+        }
+        if (!g_autarkMode || prev.hasPollFast != loaded.hasPollFast || prev.pollFast != loaded.pollFast) {
+            update.pollFastChanged = true;
+        }
+        if (!g_autarkMode || prev.hasCallsign != loaded.hasCallsign || prev.callsign != loaded.callsign) {
+            update.callsignChanged = true;
+        }
+    }
+
+    g_autarkMode = enabled;
+    if (enabled) {
+        g_autarkConfig = loaded;
+    } else {
+        g_autarkConfig = AutarkConfig{};
+    }
+    return update;
+}
+
+std::string GetActiveLogon() {
+    if (g_autarkMode) {
+        if (!g_autarkConfig.hasLogon) {
+            return "";
+        }
+        return Trim(g_autarkConfig.logon);
+    }
+    return Trim(GetDataRefString(g_dref.logon));
+}
+
+void ApplyAutarkPollFastOverride() {
+    if (!g_autarkMode || !g_autarkConfig.hasPollFast) {
+        return;
+    }
+    SetDataRefBool(g_dref.poll_frequency_fast, g_autarkConfig.pollFast);
+}
+
+bool ApplyAutarkCallsign(std::string* callsign) {
+    if (!callsign) {
+        return false;
+    }
+    if (!g_autarkMode || !g_autarkConfig.hasCallsign) {
+        return false;
+    }
+    std::string pref = Trim(g_autarkConfig.callsign);
+    if (pref.empty()) {
+        return false;
+    }
+    std::string current = Trim(*callsign);
+    bool shouldApply = false;
+    if (current.empty()) {
+        shouldApply = true;
+    } else if (!g_autarkAppliedCallsign.empty()
+        && g_autarkAppliedCallsign != pref
+        && current == g_autarkAppliedCallsign) {
+        shouldApply = true;
+    }
+    if (!shouldApply) {
+        return false;
+    }
+    SetDataRefString(g_dref.callsign, pref);
+    *callsign = pref;
+    g_autarkAppliedCallsign = pref;
+    Log(LOG_INFO, "Callsign set from prefs: " + pref);
+    return true;
 }
 
 bool IsZiboPluginLoaded() {
@@ -322,6 +583,7 @@ bool UpdateZiboState() {
 void ResetOperationalState(double now) {
     g_refsReady = false;
     g_nextRefScanTime = now;
+    g_nextPollTime = 0.0;
     g_commEstablished = false;
     g_sendPending = false;
     g_pollPending = false;
@@ -335,6 +597,7 @@ void ResetOperationalState(double now) {
     g_logonKnown = false;
     g_logonAvailable = false;
     g_lastCallsign.clear();
+    g_autarkAppliedCallsign.clear();
     g_pendingInbox.clear();
 }
 
@@ -596,6 +859,9 @@ void UnregisterHoppieDataRefs() {
 }
 
 bool IsFastPollEnabled() {
+    if (g_autarkMode && g_autarkConfig.hasPollFast) {
+        return g_autarkConfig.pollFast;
+    }
     return g_dref.poll_frequency_fast && XPLMGetDatai(g_dref.poll_frequency_fast) != 0;
 }
 
@@ -1176,9 +1442,26 @@ void UpdateCommReady(const std::string& logon, const std::string& callsign) {
 }
 
 float FlightLoopCallback(float, float, int, void*) {
-    g_debugLevel = GetDebugLevel();
-
     double now = XPLMGetElapsedTime();
+    AutarkUpdate autarkUpdate = UpdateAutarkConfig(now);
+    g_debugLevel = GetDebugLevel();
+    if (autarkUpdate.modeChanged) {
+        ResetOperationalState(now);
+        g_nextPollTime = 0.0;
+        g_autarkAppliedCallsign.clear();
+        Log(LOG_INFO, g_autarkMode
+            ? "Autark mode enabled (prefs file found)."
+            : "Autark mode disabled (prefs file missing).");
+    }
+    if (g_autarkMode && autarkUpdate.logonChanged) {
+        g_commEstablished = false;
+        SetDataRefBool(g_dref.comm_ready, false);
+        g_nextPollTime = 0.0;
+        g_logonKnown = false;
+        g_logonAvailable = false;
+    }
+    ApplyAutarkPollFastOverride();
+
     bool ziboReady = UpdateZiboState();
     if (!ziboReady) {
         if (g_refsReady || g_commEstablished || g_sendPending || g_pollPending || !g_pendingInbox.empty()) {
@@ -1204,13 +1487,14 @@ float FlightLoopCallback(float, float, int, void*) {
     ClearInboxIfRequested();
     DeliverQueuedInboxIfEmpty();
 
-    std::string logon = Trim(GetDataRefString(g_dref.logon));
+    std::string logon = GetActiveLogon();
     std::string callsign = Trim(GetDataRefString(g_dref.callsign));
 
     LogLogonState(logon);
     bool callsignUpdated = UpdateCallsign();
     callsign = Trim(GetDataRefString(g_dref.callsign));
-    LogCallsignState(callsign, callsignUpdated);
+    bool callsignAutark = ApplyAutarkCallsign(&callsign);
+    LogCallsignState(callsign, callsignUpdated || callsignAutark);
 
     UpdateCommReady(logon, callsign);
     bool commReady = GetDataRefBool(g_dref.comm_ready);
@@ -1280,14 +1564,16 @@ void FindDataRefs() {
     g_dref.avionics_on = XPLMFindDataRef("sim/cockpit/electrical/avionics_on");
     g_dref.tailnum = XPLMFindDataRef("sim/aircraft/view/acf_tailnum");
 
-    if (!g_dref.logon) {
+    if (!g_dref.logon && !g_autarkMode) {
         Log(LOG_DBG, "Missing dataref: YAL/hoppie/logon");
     }
 }
 
 bool HasCoreDataRefs() {
-    return g_dref.logon
-        && g_dref.comm_ready
+    if (!g_autarkMode && !g_dref.logon) {
+        return false;
+    }
+    return g_dref.comm_ready
         && g_dref.send_message_to
         && g_dref.send_message_type
         && g_dref.send_message_packet
@@ -1348,7 +1634,7 @@ void RefreshDataRefs(double now) {
         LogReadySummary();
     } else if (!g_loggedMissingRefs) {
         g_loggedMissingRefs = true;
-        Log(LOG_INFO, "Waiting for YAL datarefs...");
+        Log(LOG_INFO, g_autarkMode ? "Waiting for core datarefs..." : "Waiting for YAL datarefs...");
     }
 }
 
@@ -1382,6 +1668,16 @@ PLUGIN_API int XPluginEnable() {
     EnsureHoppieDataRefs();
     FindDataRefs();
     g_nextPollTime = 0.0;
+    g_nextPrefScanTime = 0.0;
+    g_autarkMode = false;
+    g_autarkConfig = AutarkConfig{};
+    g_autarkAppliedCallsign.clear();
+    AutarkUpdate autarkUpdate = UpdateAutarkConfig(XPLMGetElapsedTime());
+    g_debugLevel = GetDebugLevel();
+    if (autarkUpdate.modeChanged && g_autarkMode) {
+        Log(LOG_INFO, "Autark mode enabled (prefs file found).");
+    }
+    ApplyAutarkPollFastOverride();
     g_refsReady = HasCoreDataRefs();
     g_loggedMissingRefs = false;
     g_nextRefScanTime = 0.0;
@@ -1403,7 +1699,7 @@ PLUGIN_API int XPluginEnable() {
     g_lastTailnum.clear();
     if (!g_refsReady) {
         g_loggedMissingRefs = true;
-        Log(LOG_INFO, "Waiting for YAL datarefs...");
+        Log(LOG_INFO, g_autarkMode ? "Waiting for core datarefs..." : "Waiting for YAL datarefs...");
     } else {
         Log(LOG_INFO, "Required datarefs found. Helper ready.");
         LogReadySummary();
@@ -1454,6 +1750,10 @@ PLUGIN_API void XPluginDisable() {
     g_tailnumKnown = false;
     g_lastTailnumMatches = false;
     g_lastTailnum.clear();
+    g_autarkMode = false;
+    g_autarkConfig = AutarkConfig{};
+    g_autarkAppliedCallsign.clear();
+    g_nextPrefScanTime = 0.0;
     SetStatus("DISABLED");
     Log(LOG_INFO, "Disabled");
 }
