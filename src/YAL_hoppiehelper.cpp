@@ -26,6 +26,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <vector>
 
 PLUGIN_API void XPluginDisable(void);
 
@@ -33,8 +34,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "1.2";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.2";
+constexpr const char* kPluginVersion = "1.3";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.3";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
@@ -233,6 +234,7 @@ bool UpdateZiboState();
 void ResetOperationalState(double now);
 bool InboxHasMessage();
 bool BuildInboundMessage(const std::string& origin, const std::string& raw, InboundMessage* out);
+bool BuildInboundMessages(const std::string& origin, const std::string& raw, std::vector<InboundMessage>* out);
 void ApplyInboxMessage(const InboundMessage& msg);
 void QueueInboundMessage(const std::string& origin, const std::string& raw);
 void DeliverQueuedInboxIfEmpty();
@@ -1254,6 +1256,38 @@ bool BuildInboundMessage(const std::string& origin, const std::string& raw, Inbo
     return true;
 }
 
+bool BuildInboundMessages(const std::string& origin, const std::string& raw, std::vector<InboundMessage>* out) {
+    if (!out) {
+        return false;
+    }
+    out->clear();
+    std::string trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return false;
+    }
+    static const std::regex kHoppiePattern(R"(\{([^\s]+)\s+([^\s]+)\s+\{([\s\S]+?)\}\})");
+    std::sregex_iterator it(trimmed.begin(), trimmed.end(), kHoppiePattern);
+    std::sregex_iterator end;
+    if (it == end) {
+        InboundMessage msg;
+        if (!BuildInboundMessage(origin, trimmed, &msg)) {
+            return false;
+        }
+        out->push_back(std::move(msg));
+        return true;
+    }
+    for (; it != end; ++it) {
+        InboundMessage msg;
+        msg.origin = origin;
+        msg.raw = Trim(it->str(0));
+        msg.from = (*it)[1].str();
+        msg.type = (*it)[2].str();
+        msg.packet = Trim((*it)[3].str());
+        out->push_back(std::move(msg));
+    }
+    return !out->empty();
+}
+
 void ApplyInboxMessage(const InboundMessage& msg) {
     SetDataRefString(g_dref.poll_message_origin, msg.origin);
     SetDataRefString(g_dref.poll_message_from, msg.from);
@@ -1273,16 +1307,18 @@ void ApplyInboxMessage(const InboundMessage& msg) {
 }
 
 void QueueInboundMessage(const std::string& origin, const std::string& raw) {
-    InboundMessage msg;
-    if (!BuildInboundMessage(origin, raw, &msg)) {
+    std::vector<InboundMessage> messages;
+    if (!BuildInboundMessages(origin, raw, &messages)) {
         return;
     }
-    if (InboxHasMessage()) {
-        g_pendingInbox.push_back(std::move(msg));
-        Log(LOG_INFO, "Inbox busy; queued " + origin + " message.");
-        return;
+    for (auto& msg : messages) {
+        if (InboxHasMessage()) {
+            g_pendingInbox.push_back(std::move(msg));
+            Log(LOG_INFO, "Inbox busy; queued " + origin + " message.");
+            continue;
+        }
+        ApplyInboxMessage(msg);
     }
-    ApplyInboxMessage(msg);
 }
 
 void DeliverQueuedInboxIfEmpty() {
