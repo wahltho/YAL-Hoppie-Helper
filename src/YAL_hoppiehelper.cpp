@@ -70,6 +70,7 @@ struct DataRefs {
     XPLMDataRef hbdr_ready = nullptr;
     XPLMDataRef avionics_on = nullptr;
     XPLMDataRef tailnum = nullptr;
+    XPLMDataRef reload_request = nullptr;
 };
 
 constexpr int kNumberDataRefTypes = xplmType_Int | xplmType_Float | xplmType_Double;
@@ -108,6 +109,9 @@ std::array<OwnedDataRef, 14> g_ownedDataRefs = {{
 DataRefs g_dref;
 std::atomic<bool> g_running{false};
 std::thread g_worker;
+XPLMCommandRef g_reloadCmd = nullptr;
+bool g_loggedReloadCmdMissing = false;
+bool g_loggedReloadDatarefMissing = false;
 
 enum class JobType { Send, Poll };
 
@@ -1477,6 +1481,37 @@ void UpdateCommReady(const std::string& logon, const std::string& callsign) {
     }
 }
 
+bool HandleReloadRequest() {
+    if (!g_dref.reload_request) {
+        if (!g_loggedReloadDatarefMissing) {
+            g_loggedReloadDatarefMissing = true;
+            Log(LOG_DBG, "Missing dataref: YAL/command/reload");
+        }
+        return false;
+    }
+    int request = XPLMGetDatai(g_dref.reload_request);
+    if (request == 0) {
+        return false;
+    }
+    XPLMSetDatai(g_dref.reload_request, 0);
+    if (!g_reloadCmd) {
+        g_reloadCmd = XPLMFindCommand("sasl/reload/YAL");
+        if (!g_reloadCmd) {
+            g_reloadCmd = XPLMFindCommand("sasl/reload/yal");
+        }
+    }
+    if (!g_reloadCmd) {
+        if (!g_loggedReloadCmdMissing) {
+            g_loggedReloadCmdMissing = true;
+            Log(LOG_INFO, "Reload command not found (sasl/reload/YAL or sasl/reload/yal).");
+        }
+        return false;
+    }
+    Log(LOG_INFO, "Reload requested via YAL/command/reload.");
+    XPLMCommandOnce(g_reloadCmd);
+    return true;
+}
+
 float FlightLoopCallback(float, float, int, void*) {
     double now = XPLMGetElapsedTime();
     AutarkUpdate autarkUpdate = UpdateAutarkConfig(now);
@@ -1516,6 +1551,9 @@ float FlightLoopCallback(float, float, int, void*) {
         DrainResults(false);
         SetDataRefBool(g_dref.comm_ready, false);
         SetStatus("WAIT_YAL");
+        return kFlightLoopInterval;
+    }
+    if (HandleReloadRequest()) {
         return kFlightLoopInterval;
     }
 
@@ -1596,6 +1634,10 @@ void FindDataRefs() {
     g_dref.last_http = XPLMFindDataRef("YAL/hoppie/last_http");
     g_dref.send_count = XPLMFindDataRef("YAL/hoppie/send_count");
     g_dref.poll_count = XPLMFindDataRef("YAL/hoppie/poll_count");
+    g_dref.reload_request = XPLMFindDataRef("YAL/command/reload");
+    if (!g_dref.reload_request) {
+        g_dref.reload_request = XPLMFindDataRef("yal/command/reload");
+    }
     g_dref.hbdr_ready = XPLMFindDataRef("laminar/B738/HBDR_ready");
     g_dref.avionics_on = XPLMFindDataRef("sim/cockpit/electrical/avionics_on");
     g_dref.tailnum = XPLMFindDataRef("sim/aircraft/view/acf_tailnum");
