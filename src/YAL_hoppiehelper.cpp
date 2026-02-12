@@ -1483,6 +1483,15 @@ void UpdateCommReady(const std::string& logon, const std::string& callsign) {
 
 bool HandleReloadRequest() {
     if (!g_dref.reload_request) {
+        g_dref.reload_request = XPLMFindDataRef("YAL/command/reload");
+        if (!g_dref.reload_request) {
+            g_dref.reload_request = XPLMFindDataRef("yal/command/reload");
+        }
+        if (g_dref.reload_request) {
+            g_loggedReloadDatarefMissing = false;
+        }
+    }
+    if (!g_dref.reload_request) {
         if (!g_loggedReloadDatarefMissing) {
             g_loggedReloadDatarefMissing = true;
             Log(LOG_DBG, "Missing dataref: YAL/command/reload");
