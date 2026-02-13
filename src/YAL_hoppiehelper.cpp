@@ -71,6 +71,8 @@ struct DataRefs {
     XPLMDataRef avionics_on = nullptr;
     XPLMDataRef tailnum = nullptr;
     XPLMDataRef reload_request = nullptr;
+    XPLMDataRef voice_seq = nullptr;
+    XPLMDataRef voice_text = nullptr;
 };
 
 constexpr int kNumberDataRefTypes = xplmType_Int | xplmType_Float | xplmType_Double;
@@ -89,7 +91,7 @@ struct OwnedDataRef {
     bool owned = false;
 };
 
-std::array<OwnedDataRef, 14> g_ownedDataRefs = {{
+std::array<OwnedDataRef, 16> g_ownedDataRefs = {{
     {"hoppiebridge/send_queue", xplmType_Data, true},
     {"hoppiebridge/send_message_to", xplmType_Data, true},
     {"hoppiebridge/send_message_type", xplmType_Data, true},
@@ -104,6 +106,8 @@ std::array<OwnedDataRef, 14> g_ownedDataRefs = {{
     {"hoppiebridge/poll_queue_clear", kNumberDataRefTypes, false},
     {"hoppiebridge/callsign", xplmType_Data, true},
     {"hoppiebridge/comm_ready", kNumberDataRefTypes, false},
+    {"YAL/hoppie/voice_seq", xplmType_Int, false},
+    {"YAL/hoppie/voice_text", xplmType_Data, true},
 }};
 
 DataRefs g_dref;
@@ -1011,7 +1015,7 @@ void EnsureHoppieDataRefs() {
         ++created;
     }
     if (created > 0) {
-        Log(LOG_INFO, "Registered " + std::to_string(created) + " hoppiebridge datarefs.");
+        Log(LOG_INFO, "Registered " + std::to_string(created) + " helper datarefs.");
     }
 }
 
@@ -1464,6 +1468,13 @@ void ApplyInboxMessage(const InboundMessage& msg) {
     if (g_dref.poll_count) {
         XPLMSetDatai(g_dref.poll_count, XPLMGetDatai(g_dref.poll_count) + 1);
     }
+    if (g_dref.voice_seq) {
+        XPLMSetDatai(g_dref.voice_seq, XPLMGetDatai(g_dref.voice_seq) + 1);
+    }
+    if (g_dref.voice_text) {
+        std::string voice = msg.packet.empty() ? msg.raw : msg.packet;
+        SetDataRefString(g_dref.voice_text, voice);
+    }
     std::string label = msg.origin == "response" ? "Response" : "Poll";
     if (!msg.from.empty() || !msg.type.empty()) {
         Log(LOG_INFO, label + " message from " + msg.from + " type " + msg.type);
@@ -1826,6 +1837,8 @@ void FindDataRefs() {
     g_dref.last_http = XPLMFindDataRef("YAL/hoppie/last_http");
     g_dref.send_count = XPLMFindDataRef("YAL/hoppie/send_count");
     g_dref.poll_count = XPLMFindDataRef("YAL/hoppie/poll_count");
+    g_dref.voice_seq = XPLMFindDataRef("YAL/hoppie/voice_seq");
+    g_dref.voice_text = XPLMFindDataRef("YAL/hoppie/voice_text");
     g_dref.reload_request = XPLMFindDataRef("YAL/command/reload");
     if (!g_dref.reload_request) {
         g_dref.reload_request = XPLMFindDataRef("yal/command/reload");
