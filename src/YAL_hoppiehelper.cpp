@@ -34,8 +34,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "1.3";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.3";
+constexpr const char* kPluginVersion = "1.4";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.4";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
@@ -124,6 +124,12 @@ struct HttpJob {
     std::string packet;
 };
 
+struct LegacyOutboxMessage {
+    std::string to;
+    std::string type;
+    std::string packet;
+};
+
 struct HttpResult {
     JobType type;
     bool ok = false;
@@ -147,6 +153,7 @@ std::queue<HttpResult> g_results;
 std::mutex g_ownedMutex;
 std::mt19937 g_rng{std::random_device{}()};
 std::deque<InboundMessage> g_pendingInbox;
+std::string g_lastBadSendQueue;
 
 bool g_sendPending = false;
 bool g_pollPending = false;
@@ -240,6 +247,7 @@ bool InboxHasMessage();
 bool BuildInboundMessage(const std::string& origin, const std::string& raw, InboundMessage* out);
 bool BuildInboundMessages(const std::string& origin, const std::string& raw, std::vector<InboundMessage>* out);
 void ApplyInboxMessage(const InboundMessage& msg);
+bool ParseLegacyOutboxMessage(const std::string& raw, LegacyOutboxMessage* out);
 void QueueInboundMessage(const std::string& origin, const std::string& raw);
 void DeliverQueuedInboxIfEmpty();
 
@@ -361,6 +369,160 @@ bool ParseBool(const std::string& s, bool* out) {
         return true;
     }
     return false;
+}
+
+void SkipWhitespace(const std::string& s, size_t* idx) {
+    if (!idx) {
+        return;
+    }
+    while (*idx < s.size() && std::isspace(static_cast<unsigned char>(s[*idx]))) {
+        ++(*idx);
+    }
+}
+
+void SkipWhitespaceAndCommas(const std::string& s, size_t* idx) {
+    if (!idx) {
+        return;
+    }
+    while (*idx < s.size()) {
+        char c = s[*idx];
+        if (c == ',' || std::isspace(static_cast<unsigned char>(c))) {
+            ++(*idx);
+            continue;
+        }
+        break;
+    }
+}
+
+char DecodeEscapeChar(char c) {
+    switch (c) {
+        case 'n': return '\n';
+        case 'r': return '\r';
+        case 't': return '\t';
+        case '\\': return '\\';
+        case '"': return '"';
+        case '\'': return '\'';
+        default: return c;
+    }
+}
+
+bool ParseQuotedToken(const std::string& s, size_t* idx, std::string* out) {
+    if (!idx || !out || *idx >= s.size()) {
+        return false;
+    }
+    char quote = s[*idx];
+    if (quote != '"' && quote != '\'') {
+        return false;
+    }
+    ++(*idx);
+    out->clear();
+    while (*idx < s.size()) {
+        char c = s[*idx];
+        if (c == '\\' && *idx + 1 < s.size()) {
+            char next = s[*idx + 1];
+            out->push_back(DecodeEscapeChar(next));
+            *idx += 2;
+            continue;
+        }
+        if (c == quote) {
+            ++(*idx);
+            return true;
+        }
+        out->push_back(c);
+        ++(*idx);
+    }
+    return false;
+}
+
+bool ParseKeyToken(const std::string& s, size_t* idx, std::string* out) {
+    if (!idx || !out || *idx >= s.size()) {
+        return false;
+    }
+    char c = s[*idx];
+    if (c == '"' || c == '\'') {
+        return ParseQuotedToken(s, idx, out);
+    }
+    size_t start = *idx;
+    while (*idx < s.size()) {
+        char cur = s[*idx];
+        if (cur == ':' || cur == ',' || std::isspace(static_cast<unsigned char>(cur))) {
+            break;
+        }
+        ++(*idx);
+    }
+    if (*idx == start) {
+        return false;
+    }
+    *out = s.substr(start, *idx - start);
+    return true;
+}
+
+bool ParseValueToken(const std::string& s, size_t* idx, std::string* out) {
+    if (!idx || !out || *idx >= s.size()) {
+        return false;
+    }
+    char c = s[*idx];
+    if (c == '"' || c == '\'') {
+        return ParseQuotedToken(s, idx, out);
+    }
+    size_t start = *idx;
+    while (*idx < s.size()) {
+        char cur = s[*idx];
+        if (cur == ',') {
+            break;
+        }
+        ++(*idx);
+    }
+    if (*idx == start) {
+        out->clear();
+        return false;
+    }
+    *out = Trim(s.substr(start, *idx - start));
+    return true;
+}
+
+bool ParseLegacyOutboxMessage(const std::string& raw, LegacyOutboxMessage* out) {
+    if (!out) {
+        return false;
+    }
+    *out = LegacyOutboxMessage{};
+    std::string trimmed = Trim(raw);
+    if (trimmed.empty()) {
+        return false;
+    }
+    if (trimmed.front() == '{' && trimmed.back() == '}' && trimmed.size() >= 2) {
+        trimmed = trimmed.substr(1, trimmed.size() - 2);
+    }
+    size_t idx = 0;
+    while (idx < trimmed.size()) {
+        SkipWhitespaceAndCommas(trimmed, &idx);
+        if (idx >= trimmed.size()) {
+            break;
+        }
+        std::string key;
+        if (!ParseKeyToken(trimmed, &idx, &key)) {
+            break;
+        }
+        SkipWhitespace(trimmed, &idx);
+        if (idx >= trimmed.size() || trimmed[idx] != ':') {
+            break;
+        }
+        ++idx;
+        SkipWhitespace(trimmed, &idx);
+        std::string value;
+        if (!ParseValueToken(trimmed, &idx, &value)) {
+            break;
+        }
+        std::string keyLower = ToLower(Trim(key));
+        if (keyLower == "to") {
+            out->to = Trim(value);
+        } else if (keyLower == "type") {
+            out->type = Trim(value);
+        } else if (keyLower == "packet") {
+            out->packet = value;
+        }
+    }
+    return !out->to.empty() && !out->type.empty() && !out->packet.empty();
 }
 
 std::string GetPrefsDir() {
@@ -1591,7 +1753,28 @@ float FlightLoopCallback(float, float, int, void*) {
         std::string to = Trim(GetDataRefString(g_dref.send_message_to));
         std::string type = Trim(GetDataRefString(g_dref.send_message_type));
         std::string packet = Trim(GetDataRefString(g_dref.send_message_packet));
-        if (!to.empty() && !type.empty() && !packet.empty()) {
+        bool structuredReady = !to.empty() && !type.empty() && !packet.empty();
+        bool structuredPartial = !to.empty() || !type.empty() || !packet.empty();
+        if (!structuredReady) {
+            if (structuredPartial) {
+                Log(LOG_DBG, "Ignoring incomplete structured message fields; falling back to send_queue.");
+            }
+            std::string legacyRaw = Trim(GetDataRefString(g_dref.send_queue));
+            if (!legacyRaw.empty()) {
+                LegacyOutboxMessage legacy{};
+                if (ParseLegacyOutboxMessage(legacyRaw, &legacy)) {
+                    to = legacy.to;
+                    type = legacy.type;
+                    packet = legacy.packet;
+                    structuredReady = true;
+                    g_lastBadSendQueue.clear();
+                } else if (legacyRaw != g_lastBadSendQueue) {
+                    g_lastBadSendQueue = legacyRaw;
+                    Log(LOG_ERR, "send_queue parse failed; ignoring legacy payload.");
+                }
+            }
+        }
+        if (structuredReady) {
             HttpJob job;
             job.type = JobType::Send;
             job.logon = logon;

@@ -10,4 +10,4 @@ Docs:
 - Install and deploy: `INSTALL.md`
 - Build instructions: `BUILD.md`
 
-Current plugin version: 1.3
+Current plugin version: 1.4
