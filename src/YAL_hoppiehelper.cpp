@@ -1,4 +1,6 @@
 #include "XPLMDataAccess.h"
+#include "XPLMDisplay.h"
+#include "XPLMGraphics.h"
 #include "XPLMPlugin.h"
 #include "XPLMProcessing.h"
 #include "XPLMUtilities.h"
@@ -18,12 +20,14 @@
 #include <condition_variable>
 #include <cctype>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <mutex>
 #include <queue>
 #include <random>
 #include <regex>
 #include <sstream>
+#include <system_error>
 #include <string>
 #include <thread>
 #include <vector>
@@ -34,8 +38,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "1.4";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.4";
+constexpr const char* kPluginVersion = "1.6";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.6";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
@@ -44,6 +48,15 @@ constexpr int kPollDefaultMinSeconds = 45;
 constexpr int kPollDefaultMaxSeconds = 75;
 constexpr int kPollFastMinSeconds = 12;
 constexpr int kPollFastMaxSeconds = 18;
+constexpr size_t kUpdateLogMaxEntries = 200;
+constexpr float kUpdatePopupAutoHideSeconds = 15.0f;
+constexpr float kUpdateConfirmTimeoutSeconds = 30.0f;
+constexpr int kUpdatePopupMaxLines = 12;
+constexpr int kUpdatePopupPadding = 10;
+constexpr int kUpdatePopupMargin = 30;
+constexpr int kUpdateButtonWidth = 90;
+constexpr int kUpdateButtonHeight = 22;
+constexpr int kUpdateButtonGap = 10;
 
 struct DataRefs {
     XPLMDataRef send_queue = nullptr;
@@ -117,7 +130,16 @@ XPLMCommandRef g_reloadCmd = nullptr;
 bool g_loggedReloadCmdMissing = false;
 bool g_loggedReloadDatarefMissing = false;
 
-enum class JobType { Send, Poll };
+enum class JobType { Send, Poll, Update, UpdateScan };
+
+struct UpdateCounters {
+    size_t copied = 0;
+    size_t skipped = 0;
+    size_t dirs = 0;
+    size_t deleted = 0;
+    size_t deleteFailed = 0;
+    size_t failed = 0;
+};
 
 struct HttpJob {
     JobType type;
@@ -126,6 +148,11 @@ struct HttpJob {
     std::string to;
     std::string msg_type;
     std::string packet;
+    std::string update_source;
+    std::string update_target;
+    std::vector<std::string> update_excludes;
+    bool update_log_details = false;
+    size_t update_log_limit = 0;
 };
 
 struct LegacyOutboxMessage {
@@ -140,6 +167,9 @@ struct HttpResult {
     std::string response;
     std::string error;
     long httpCode = 0;
+    std::vector<std::string> update_log_lines;
+    size_t update_log_omitted = 0;
+    UpdateCounters update_counts;
 };
 
 struct InboundMessage {
@@ -187,6 +217,32 @@ bool g_tailnumKnown = false;
 bool g_lastTailnumMatches = false;
 std::string g_lastTailnum;
 
+enum class UpdatePopupMode { None, Info, Confirm };
+
+struct UiRect {
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+};
+
+XPLMWindowID g_updateWindow = nullptr;
+bool g_updatePopupVisible = false;
+double g_updatePopupHideAt = 0.0;
+std::vector<std::string> g_updatePopupLines;
+UpdatePopupMode g_updatePopupMode = UpdatePopupMode::None;
+bool g_updateButtonsValid = false;
+UiRect g_updateButtonOk;
+UiRect g_updateButtonAbort;
+int g_updatePopupButtonArea = 0;
+bool g_updateDecisionPending = false;
+double g_updateDecisionDeadline = 0.0;
+bool g_updateScanPending = false;
+bool g_reloadRequested = false;
+bool g_updateShowResultPopup = false;
+std::string g_updatePlanTarget;
+bool g_updatePlanValid = false;
+
 struct AutarkConfig {
     bool enabled = false;
     bool hasLogon = false;
@@ -205,12 +261,32 @@ struct AutarkUpdate {
     bool debugChanged = false;
     bool pollFastChanged = false;
     bool callsignChanged = false;
+    bool updateChanged = false;
 };
 
 bool g_autarkMode = false;
 AutarkConfig g_autarkConfig;
 std::string g_autarkAppliedCallsign;
 double g_nextPrefScanTime = 0.0;
+
+struct UpdateConfig {
+    bool enabled = false;
+    std::string source;
+    std::vector<std::string> excludes;
+};
+
+struct UpdateUiConfig {
+    bool hasWindowPos = false;
+    int windowLeft = 0;
+    int windowTop = 0;
+};
+
+UpdateConfig g_updateConfig;
+UpdateConfig g_updatePlanConfig;
+UpdateUiConfig g_updateUiConfig;
+bool g_updatePending = false;
+bool g_reloadAfterUpdate = false;
+double g_reloadAfterUpdateAt = 0.0;
 
 enum LogLevel { LOG_ERR = 1, LOG_INFO = 2, LOG_DBG = 3 };
 
@@ -227,12 +303,17 @@ double GetDatadCB(void* refcon);
 void SetDatadCB(void* refcon, double value);
 int GetDatabCB(void* refcon, void* outValue, int offset, int max);
 void SetDatabCB(void* refcon, void* inValue, int offset, int max);
+std::string Trim(const std::string& s);
+std::string ToLower(const std::string& s);
+std::string GetAutarkPrefPath();
+std::string BuildUpdatePathError(const char* label, const std::filesystem::path& path, const std::error_code& ec);
 bool HasCoreDataRefs();
 void RefreshDataRefs(double now);
 void RefreshHbdrReady(bool allowReady);
 void EnsureHoppieDataRefs();
 void UnregisterHoppieDataRefs();
 AutarkUpdate UpdateAutarkConfig(double now);
+bool TriggerReload(const char* reason);
 std::string GetActiveLogon();
 bool ApplyAutarkCallsign(std::string* callsign);
 void ApplyAutarkPollFastOverride();
@@ -254,6 +335,23 @@ void ApplyInboxMessage(const InboundMessage& msg);
 bool ParseLegacyOutboxMessage(const std::string& raw, LegacyOutboxMessage* out);
 void QueueInboundMessage(const std::string& origin, const std::string& raw);
 void DeliverQueuedInboxIfEmpty();
+void EnqueueJob(const HttpJob& job);
+bool PerformUpdateJob(const HttpJob& job,
+    bool dryRun,
+    std::string* summary,
+    std::string* error,
+    std::vector<std::string>* logLines,
+    size_t* logOmitted,
+    UpdateCounters* counters);
+void EnsureUpdateWindow();
+void ShowUpdatePopup(const std::vector<std::string>& lines);
+void ShowUpdateConfirm(const std::vector<std::string>& lines);
+void UpdatePopupVisibility(double now);
+void HideUpdatePopup();
+void SaveUpdateWindowPosition();
+bool WriteUpdateWindowPos(int left, int top);
+void HandleUpdateDecision(bool accept, const char* reason);
+bool StartUpdateFromPlan(const char* reason);
 
 void Log(LogLevel level, const std::string& msg) {
     if (g_debugLevel < level) {
@@ -261,6 +359,428 @@ void Log(LogLevel level, const std::string& msg) {
     }
     std::string line = std::string("[YAL HoppieHelper] ") + msg + "\n";
     XPLMDebugString(line.c_str());
+}
+
+void LogAlways(const std::string& msg) {
+    std::string line = std::string("[YAL HoppieHelper] ") + msg + "\n";
+    XPLMDebugString(line.c_str());
+}
+
+bool PointInRect(int x, int y, const UiRect& rect) {
+    return x >= rect.left && x <= rect.right && y >= rect.bottom && y <= rect.top;
+}
+
+int UpdateWindowHandleMouseClick(XPLMWindowID, int x, int y, XPLMMouseStatus status, void*) {
+    if (status != xplm_MouseDown) {
+        return 0;
+    }
+    if (g_updatePopupMode != UpdatePopupMode::Confirm || !g_updateDecisionPending || !g_updateButtonsValid) {
+        return 0;
+    }
+    if (PointInRect(x, y, g_updateButtonOk)) {
+        HandleUpdateDecision(true, "ok");
+        return 1;
+    }
+    if (PointInRect(x, y, g_updateButtonAbort)) {
+        HandleUpdateDecision(false, "abort");
+        return 1;
+    }
+    return 0;
+}
+
+int UpdateWindowHandleRightClick(XPLMWindowID, int, int, XPLMMouseStatus, void*) {
+    return 0;
+}
+
+int UpdateWindowHandleMouseWheel(XPLMWindowID, int, int, int, int, void*) {
+    return 0;
+}
+
+XPLMCursorStatus UpdateWindowHandleCursor(XPLMWindowID, int, int, void*) {
+    return xplm_CursorDefault;
+}
+
+void UpdateWindowHandleKey(XPLMWindowID, char, XPLMKeyFlags, char, void*, int) {
+}
+
+void UpdateWindowDraw(XPLMWindowID windowId, void*) {
+    if (!g_updatePopupVisible || g_updatePopupLines.empty()) {
+        return;
+    }
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    XPLMGetWindowGeometry(windowId, &left, &top, &right, &bottom);
+    XPLMDrawTranslucentDarkBox(left, top, right, bottom);
+
+    int charWidth = 0;
+    int charHeight = 0;
+    int digitsOnly = 0;
+    XPLMGetFontDimensions(xplmFont_Basic, &charWidth, &charHeight, &digitsOnly);
+    int lineHeight = charHeight + 2;
+    int x = left + kUpdatePopupPadding;
+    int y = top - kUpdatePopupPadding - charHeight;
+    float color[] = {1.0f, 1.0f, 1.0f};
+    int bottomLimit = bottom + kUpdatePopupPadding;
+    if (g_updatePopupMode == UpdatePopupMode::Confirm) {
+        bottomLimit += g_updatePopupButtonArea;
+    }
+    for (const auto& line : g_updatePopupLines) {
+        XPLMDrawString(color, x, y, const_cast<char*>(line.c_str()), nullptr, xplmFont_Basic);
+        y -= lineHeight;
+        if (y < bottomLimit) {
+            break;
+        }
+    }
+
+    if (g_updatePopupMode == UpdatePopupMode::Confirm && g_updateButtonsValid) {
+        XPLMDrawTranslucentDarkBox(
+            g_updateButtonOk.left, g_updateButtonOk.top, g_updateButtonOk.right, g_updateButtonOk.bottom);
+        XPLMDrawTranslucentDarkBox(
+            g_updateButtonAbort.left, g_updateButtonAbort.top, g_updateButtonAbort.right, g_updateButtonAbort.bottom);
+
+        const char* okText = "OK";
+        const char* abortText = "ABORT";
+        int okTextWidth = static_cast<int>(std::strlen(okText)) * charWidth;
+        int abortTextWidth = static_cast<int>(std::strlen(abortText)) * charWidth;
+        int okX = g_updateButtonOk.left + (g_updateButtonOk.right - g_updateButtonOk.left - okTextWidth) / 2;
+        int abortX =
+            g_updateButtonAbort.left + (g_updateButtonAbort.right - g_updateButtonAbort.left - abortTextWidth) / 2;
+        int textY = g_updateButtonOk.bottom + (kUpdateButtonHeight - charHeight) / 2;
+        float buttonColor[] = {0.9f, 0.9f, 0.9f};
+        XPLMDrawString(buttonColor, okX, textY, const_cast<char*>(okText), nullptr, xplmFont_Basic);
+        XPLMDrawString(buttonColor, abortX, textY, const_cast<char*>(abortText), nullptr, xplmFont_Basic);
+    }
+}
+
+void EnsureUpdateWindow() {
+    if (g_updateWindow) {
+        return;
+    }
+    XPLMCreateWindow_t params{};
+    params.structSize = sizeof(params);
+    int screenLeft = 0;
+    int screenTop = 0;
+    int screenRight = 0;
+    int screenBottom = 0;
+    XPLMGetScreenBoundsGlobal(&screenLeft, &screenTop, &screenRight, &screenBottom);
+    params.left = screenLeft + kUpdatePopupMargin;
+    params.right = params.left + 300;
+    params.top = screenTop - kUpdatePopupMargin;
+    params.bottom = params.top - 120;
+    params.visible = 0;
+    params.drawWindowFunc = UpdateWindowDraw;
+    params.handleMouseClickFunc = UpdateWindowHandleMouseClick;
+    params.handleKeyFunc = UpdateWindowHandleKey;
+    params.handleCursorFunc = UpdateWindowHandleCursor;
+    params.handleMouseWheelFunc = UpdateWindowHandleMouseWheel;
+    params.refcon = nullptr;
+#if defined(XPLM301)
+    params.decorateAsFloatingWindow = xplm_WindowDecorationRoundRectangle;
+#endif
+#if defined(XPLM300)
+    params.layer = xplm_WindowLayerFloatingWindows;
+    params.handleRightClickFunc = UpdateWindowHandleRightClick;
+#endif
+    g_updateWindow = XPLMCreateWindowEx(&params);
+#if defined(XPLM300)
+    if (g_updateWindow) {
+        XPLMSetWindowPositioningMode(g_updateWindow, xplm_WindowPositionFree, -1);
+    }
+#endif
+}
+
+void ComputeUpdateWindowGeometry(int width, int height, int* left, int* top, int* right, int* bottom) {
+    if (!left || !top || !right || !bottom) {
+        return;
+    }
+    int screenLeft = 0;
+    int screenTop = 0;
+    int screenRight = 0;
+    int screenBottom = 0;
+    XPLMGetScreenBoundsGlobal(&screenLeft, &screenTop, &screenRight, &screenBottom);
+
+    if (g_updateUiConfig.hasWindowPos) {
+        *left = g_updateUiConfig.windowLeft;
+        *top = g_updateUiConfig.windowTop;
+        *right = *left + width;
+        *bottom = *top - height;
+    } else {
+        *right = screenRight - kUpdatePopupMargin;
+        *left = *right - width;
+        *top = screenTop - kUpdatePopupMargin;
+        *bottom = *top - height;
+    }
+
+    if (*left < screenLeft + kUpdatePopupMargin) {
+        *left = screenLeft + kUpdatePopupMargin;
+        *right = *left + width;
+    }
+    if (*right > screenRight - kUpdatePopupMargin) {
+        *right = screenRight - kUpdatePopupMargin;
+        *left = *right - width;
+    }
+    if (*top > screenTop - kUpdatePopupMargin) {
+        *top = screenTop - kUpdatePopupMargin;
+        *bottom = *top - height;
+    }
+    if (*bottom < screenBottom + kUpdatePopupMargin) {
+        *bottom = screenBottom + kUpdatePopupMargin;
+        *top = *bottom + height;
+    }
+}
+
+void ShowUpdatePopup(const std::vector<std::string>& lines) {
+    EnsureUpdateWindow();
+    if (!g_updateWindow) {
+        return;
+    }
+    g_updatePopupLines = lines;
+    if (g_updatePopupLines.empty()) {
+        return;
+    }
+    g_updatePopupMode = UpdatePopupMode::Info;
+    g_updateButtonsValid = false;
+    g_updatePopupButtonArea = 0;
+    if (g_updatePopupLines.size() > kUpdatePopupMaxLines) {
+        size_t keep = kUpdatePopupMaxLines - 1;
+        size_t omitted = g_updatePopupLines.size() - keep;
+        g_updatePopupLines.resize(keep);
+        g_updatePopupLines.push_back("... " + std::to_string(omitted) + " more lines");
+    }
+
+    int charWidth = 0;
+    int charHeight = 0;
+    int digitsOnly = 0;
+    XPLMGetFontDimensions(xplmFont_Basic, &charWidth, &charHeight, &digitsOnly);
+    int lineHeight = charHeight + 2;
+    int maxLen = 0;
+    for (const auto& line : g_updatePopupLines) {
+        if (static_cast<int>(line.size()) > maxLen) {
+            maxLen = static_cast<int>(line.size());
+        }
+    }
+    int width = maxLen * charWidth + kUpdatePopupPadding * 2;
+    int height = static_cast<int>(g_updatePopupLines.size()) * lineHeight + kUpdatePopupPadding * 2;
+
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    ComputeUpdateWindowGeometry(width, height, &left, &top, &right, &bottom);
+    XPLMSetWindowGeometry(g_updateWindow, left, top, right, bottom);
+    XPLMSetWindowIsVisible(g_updateWindow, 1);
+    g_updatePopupVisible = true;
+    g_updatePopupHideAt = XPLMGetElapsedTime() + kUpdatePopupAutoHideSeconds;
+}
+
+void ShowUpdateConfirm(const std::vector<std::string>& lines) {
+    EnsureUpdateWindow();
+    if (!g_updateWindow) {
+        return;
+    }
+    g_updatePopupLines = lines;
+    if (g_updatePopupLines.empty()) {
+        return;
+    }
+    g_updatePopupMode = UpdatePopupMode::Confirm;
+    g_updateButtonsValid = false;
+    g_updatePopupButtonArea = kUpdateButtonHeight + kUpdatePopupPadding * 2;
+    if (g_updatePopupLines.size() > kUpdatePopupMaxLines) {
+        size_t keep = kUpdatePopupMaxLines - 1;
+        size_t omitted = g_updatePopupLines.size() - keep;
+        g_updatePopupLines.resize(keep);
+        g_updatePopupLines.push_back("... " + std::to_string(omitted) + " more lines");
+    }
+
+    int charWidth = 0;
+    int charHeight = 0;
+    int digitsOnly = 0;
+    XPLMGetFontDimensions(xplmFont_Basic, &charWidth, &charHeight, &digitsOnly);
+    int lineHeight = charHeight + 2;
+    int maxLen = 0;
+    for (const auto& line : g_updatePopupLines) {
+        if (static_cast<int>(line.size()) > maxLen) {
+            maxLen = static_cast<int>(line.size());
+        }
+    }
+    int width = maxLen * charWidth + kUpdatePopupPadding * 2;
+    int minWidth = kUpdatePopupPadding * 2 + kUpdateButtonWidth * 2 + kUpdateButtonGap;
+    if (width < minWidth) {
+        width = minWidth;
+    }
+    int height =
+        static_cast<int>(g_updatePopupLines.size()) * lineHeight + kUpdatePopupPadding * 2 + g_updatePopupButtonArea;
+
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    ComputeUpdateWindowGeometry(width, height, &left, &top, &right, &bottom);
+    XPLMSetWindowGeometry(g_updateWindow, left, top, right, bottom);
+
+    int buttonBottom = bottom + kUpdatePopupPadding;
+    int buttonTop = buttonBottom + kUpdateButtonHeight;
+    int okRight = right - kUpdatePopupPadding;
+    int okLeft = okRight - kUpdateButtonWidth;
+    int abortRight = okLeft - kUpdateButtonGap;
+    int abortLeft = abortRight - kUpdateButtonWidth;
+    g_updateButtonOk = {okLeft, buttonTop, okRight, buttonBottom};
+    g_updateButtonAbort = {abortLeft, buttonTop, abortRight, buttonBottom};
+    g_updateButtonsValid = true;
+
+    XPLMSetWindowIsVisible(g_updateWindow, 1);
+    g_updatePopupVisible = true;
+    g_updateDecisionPending = true;
+    g_updateDecisionDeadline = XPLMGetElapsedTime() + kUpdateConfirmTimeoutSeconds;
+}
+
+void HideUpdatePopup() {
+    if (!g_updateWindow) {
+        g_updatePopupVisible = false;
+        return;
+    }
+    SaveUpdateWindowPosition();
+    XPLMSetWindowIsVisible(g_updateWindow, 0);
+    g_updatePopupVisible = false;
+    g_updatePopupMode = UpdatePopupMode::None;
+    g_updateButtonsValid = false;
+    g_updatePopupButtonArea = 0;
+    g_updateDecisionPending = false;
+}
+
+void SaveUpdateWindowPosition() {
+    if (!g_updateWindow) {
+        return;
+    }
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    XPLMGetWindowGeometry(g_updateWindow, &left, &top, &right, &bottom);
+    if (g_updateUiConfig.hasWindowPos
+        && g_updateUiConfig.windowLeft == left
+        && g_updateUiConfig.windowTop == top) {
+        return;
+    }
+    g_updateUiConfig.hasWindowPos = true;
+    g_updateUiConfig.windowLeft = left;
+    g_updateUiConfig.windowTop = top;
+    WriteUpdateWindowPos(left, top);
+}
+
+bool WriteUpdateWindowPos(int left, int top) {
+    std::string path = GetAutarkPrefPath();
+    if (path.empty()) {
+        return false;
+    }
+
+    std::vector<std::string> lines;
+    bool leftFound = false;
+    bool topFound = false;
+
+    {
+        std::ifstream file(path);
+        if (file.is_open()) {
+            std::string line;
+            while (std::getline(file, line)) {
+                std::string trimmed = Trim(line);
+                if (!trimmed.empty() && trimmed[0] != '#' && trimmed[0] != ';') {
+                    size_t eq = trimmed.find('=');
+                    if (eq != std::string::npos) {
+                        std::string key = Trim(trimmed.substr(0, eq));
+                        std::string keyLower = ToLower(key);
+                        if (keyLower == "update_window_left") {
+                            line = "update_window_left=" + std::to_string(left);
+                            leftFound = true;
+                        } else if (keyLower == "update_window_top") {
+                            line = "update_window_top=" + std::to_string(top);
+                            topFound = true;
+                        }
+                    }
+                }
+                lines.push_back(line);
+            }
+        }
+    }
+
+    if (!leftFound) {
+        lines.push_back("update_window_left=" + std::to_string(left));
+    }
+    if (!topFound) {
+        lines.push_back("update_window_top=" + std::to_string(top));
+    }
+
+    std::ofstream out(path, std::ios::trunc);
+    if (!out.is_open()) {
+        return false;
+    }
+    for (const auto& line : lines) {
+        out << line << "\n";
+    }
+    return true;
+}
+
+void UpdatePopupVisibility(double now) {
+    if (g_updatePopupVisible && g_updatePopupMode == UpdatePopupMode::Info && now >= g_updatePopupHideAt) {
+        HideUpdatePopup();
+    }
+}
+
+bool StartUpdateFromPlan(const char* reason) {
+    if (g_updatePending) {
+        LogAlways("Update already in progress; skipping new update.");
+        return false;
+    }
+    if (!g_updatePlanValid || g_updatePlanConfig.source.empty() || g_updatePlanTarget.empty()) {
+        LogAlways("Update skipped: missing update plan.");
+        return false;
+    }
+    HttpJob job;
+    job.type = JobType::Update;
+    job.update_source = g_updatePlanConfig.source;
+    job.update_target = g_updatePlanTarget;
+    job.update_excludes = g_updatePlanConfig.excludes;
+    job.update_log_details = true;
+    job.update_log_limit = kUpdateLogMaxEntries;
+    EnqueueJob(job);
+    g_updatePending = true;
+    g_reloadAfterUpdate = true;
+    g_reloadAfterUpdateAt = 0.0;
+    g_updateShowResultPopup = false;
+    g_updatePlanValid = false;
+    g_reloadRequested = false;
+    std::string msg = "Update confirmed";
+    if (reason && *reason) {
+        msg += " (" + std::string(reason) + ")";
+    }
+    LogAlways(msg + ": " + g_updatePlanConfig.source);
+    return true;
+}
+
+void HandleUpdateDecision(bool accept, const char* reason) {
+    if (!g_updateDecisionPending) {
+        return;
+    }
+    g_updateDecisionPending = false;
+    HideUpdatePopup();
+    if (!accept) {
+        std::string msg = "Update aborted";
+        if (reason && *reason) {
+            msg += " (" + std::string(reason) + ")";
+        }
+        LogAlways(msg);
+        g_updatePlanValid = false;
+        g_reloadRequested = false;
+        TriggerReload("update aborted");
+        return;
+    }
+    if (!StartUpdateFromPlan(reason)) {
+        g_updatePlanValid = false;
+        g_reloadRequested = false;
+        TriggerReload("update skipped");
+    }
 }
 
 void SetStatus(const std::string& status) {
@@ -325,6 +845,29 @@ std::string ToLower(const std::string& s) {
     }
     return out;
 }
+
+#ifdef _WIN32
+std::string GetWin32ErrorMessage(DWORD code) {
+    if (code == 0) {
+        return "";
+    }
+    LPSTR buffer = nullptr;
+    DWORD size = FormatMessageA(
+        FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+        nullptr,
+        code,
+        MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+        reinterpret_cast<LPSTR>(&buffer),
+        0,
+        nullptr);
+    std::string msg;
+    if (size > 0 && buffer) {
+        msg.assign(buffer, size);
+        LocalFree(buffer);
+    }
+    return Trim(msg);
+}
+#endif
 
 std::string StripQuotes(const std::string& s) {
     if (s.size() < 2) {
@@ -551,11 +1094,158 @@ std::string GetAutarkPrefPath() {
     return dir + "/YAL_HoppieHelper.prf";
 }
 
-bool LoadAutarkConfig(AutarkConfig* out) {
-    if (!out) {
+std::string BuildUpdatePathError(const char* label, const std::filesystem::path& path, const std::error_code& ec) {
+    std::ostringstream oss;
+    if (label && *label) {
+        oss << label << ": ";
+    }
+    oss << path.string();
+    if (ec) {
+        oss << " (ec=" << ec.value() << ": " << ec.message() << ")";
+    }
+#ifdef _WIN32
+    DWORD attrs = GetFileAttributesW(path.wstring().c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        DWORD winerr = GetLastError();
+        if (winerr != 0) {
+            std::string winmsg = GetWin32ErrorMessage(winerr);
+            oss << " (win=" << winerr;
+            if (!winmsg.empty()) {
+                oss << ": " << winmsg;
+            }
+            oss << ")";
+        }
+    }
+#endif
+    return oss.str();
+}
+
+std::string NormalizeUpdateExcludeToken(std::string token) {
+    token = Trim(token);
+    if (token.empty()) {
+        return token;
+    }
+    for (char& c : token) {
+        if (c == '\\') {
+            c = '/';
+        }
+    }
+    if (token.rfind("./", 0) == 0) {
+        token.erase(0, 2);
+    }
+    if (!token.empty() && token.front() == '/') {
+        size_t pos = token.find_first_not_of('/');
+        if (pos == std::string::npos) {
+            return "";
+        }
+        token = "/" + token.substr(pos);
+    }
+    if (token.size() >= 2 && token.substr(token.size() - 2) == "/*") {
+        token.erase(token.size() - 2);
+    }
+    while (!token.empty() && token.back() == '/') {
+        token.pop_back();
+    }
+    return token;
+}
+
+std::vector<std::string> ParseUpdateExcludeList(const std::string& raw) {
+    std::vector<std::string> out;
+    std::string token;
+    for (char c : raw) {
+        if (c == ',' || c == ';') {
+            std::string norm = NormalizeUpdateExcludeToken(token);
+            if (!norm.empty()) {
+                out.push_back(norm);
+            }
+            token.clear();
+            continue;
+        }
+        token.push_back(c);
+    }
+    std::string norm = NormalizeUpdateExcludeToken(token);
+    if (!norm.empty()) {
+        out.push_back(norm);
+    }
+    return out;
+}
+
+void NormalizeUpdateConfig(UpdateConfig* cfg) {
+    if (!cfg) {
+        return;
+    }
+    if (cfg->source.empty()) {
+        cfg->enabled = false;
+    }
+    for (std::string& entry : cfg->excludes) {
+        entry = NormalizeUpdateExcludeToken(entry);
+    }
+    std::vector<std::string> normalized;
+    normalized.reserve(cfg->excludes.size());
+    for (const std::string& entry : cfg->excludes) {
+        if (!entry.empty()) {
+            normalized.push_back(entry);
+        }
+    }
+    cfg->excludes.swap(normalized);
+    auto hasExclude = [&](const std::string& needle) {
+        for (const std::string& entry : cfg->excludes) {
+            std::string normalized = entry;
+            while (!normalized.empty() && normalized.front() == '/') {
+                normalized.erase(normalized.begin());
+            }
+            if (normalized == needle) {
+                return true;
+            }
+        }
+        return false;
+    };
+    if (!hasExclude("data/output")) {
+        cfg->excludes.push_back("data/output");
+    }
+    if (!hasExclude(".ds_store")) {
+        cfg->excludes.push_back(".ds_store");
+    }
+    if (!hasExclude("desktop.ini")) {
+        cfg->excludes.push_back("desktop.ini");
+    }
+    if (!hasExclude("thumbs.db")) {
+        cfg->excludes.push_back("thumbs.db");
+    }
+    if (!hasExclude("agents.md")) {
+        cfg->excludes.push_back("agents.md");
+    }
+}
+
+bool UpdateConfigEquals(const UpdateConfig& a, const UpdateConfig& b) {
+    if (a.enabled != b.enabled) {
         return false;
     }
-    *out = AutarkConfig{};
+    if (a.source != b.source) {
+        return false;
+    }
+    if (a.excludes.size() != b.excludes.size()) {
+        return false;
+    }
+    for (size_t i = 0; i < a.excludes.size(); ++i) {
+        if (a.excludes[i] != b.excludes[i]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool LoadHelperConfig(AutarkConfig* autark, UpdateConfig* update, UpdateUiConfig* ui) {
+    if (!autark) {
+        return false;
+    }
+    *autark = AutarkConfig{};
+    if (update) {
+        *update = UpdateConfig{};
+    }
+    if (ui) {
+        *ui = UpdateUiConfig{};
+    }
     std::string path = GetAutarkPrefPath();
     if (path.empty()) {
         return false;
@@ -564,7 +1254,13 @@ bool LoadAutarkConfig(AutarkConfig* out) {
     if (!file.is_open()) {
         return false;
     }
-    out->enabled = true;
+    bool autarkKeySeen = false;
+    bool updateKeySeen = false;
+    bool updateEnabledSet = false;
+    bool windowLeftSet = false;
+    bool windowTopSet = false;
+    int windowLeft = 0;
+    int windowTop = 0;
     std::string line;
     while (std::getline(file, line)) {
         std::string trimmed = Trim(line);
@@ -583,26 +1279,71 @@ bool LoadAutarkConfig(AutarkConfig* out) {
         value = StripQuotes(value);
         std::string keyLower = ToLower(key);
         if (keyLower == "logon") {
-            out->hasLogon = true;
-            out->logon = Trim(value);
+            autarkKeySeen = true;
+            autark->hasLogon = true;
+            autark->logon = Trim(value);
         } else if (keyLower == "debug_level") {
             int level = 0;
             if (ParseInt(value, &level)) {
                 if (level < 0) level = 0;
                 if (level > 3) level = 3;
-                out->hasDebug = true;
-                out->debugLevel = level;
+                autarkKeySeen = true;
+                autark->hasDebug = true;
+                autark->debugLevel = level;
             }
         } else if (keyLower == "poll_fast") {
             bool enabled = false;
             if (ParseBool(value, &enabled)) {
-                out->hasPollFast = true;
-                out->pollFast = enabled;
+                autarkKeySeen = true;
+                autark->hasPollFast = true;
+                autark->pollFast = enabled;
             }
         } else if (keyLower == "callsign") {
-            out->hasCallsign = true;
-            out->callsign = Trim(value);
+            autarkKeySeen = true;
+            autark->hasCallsign = true;
+            autark->callsign = Trim(value);
+        } else if (update && keyLower == "update_enabled") {
+            bool enabled = false;
+            if (ParseBool(value, &enabled)) {
+                update->enabled = enabled;
+                updateEnabledSet = true;
+                updateKeySeen = true;
+            }
+        } else if (update && keyLower == "update_source") {
+            update->source = Trim(value);
+            updateKeySeen = true;
+        } else if (update && keyLower == "update_exclude") {
+            update->excludes = ParseUpdateExcludeList(value);
+            updateKeySeen = true;
         }
+        if (ui && keyLower == "update_window_left") {
+            int left = 0;
+            if (ParseInt(value, &left)) {
+                windowLeftSet = true;
+                windowLeft = left;
+            }
+        } else if (ui && keyLower == "update_window_top") {
+            int top = 0;
+            if (ParseInt(value, &top)) {
+                windowTopSet = true;
+                windowTop = top;
+            }
+        }
+    }
+    autark->enabled = autarkKeySeen;
+    if (update) {
+        if (!updateEnabledSet && !update->source.empty()) {
+            update->enabled = true;
+        }
+        if (!updateKeySeen) {
+            *update = UpdateConfig{};
+        }
+        NormalizeUpdateConfig(update);
+    }
+    if (ui && windowLeftSet && windowTopSet) {
+        ui->hasWindowPos = true;
+        ui->windowLeft = windowLeft;
+        ui->windowTop = windowTop;
     }
     return true;
 }
@@ -615,7 +1356,13 @@ AutarkUpdate UpdateAutarkConfig(double now) {
     g_nextPrefScanTime = now + 2.0;
 
     AutarkConfig loaded;
-    bool enabled = LoadAutarkConfig(&loaded);
+    UpdateConfig updateLoaded;
+    UpdateUiConfig uiLoaded;
+    LoadHelperConfig(&loaded, &updateLoaded, &uiLoaded);
+    if (!UpdateConfigEquals(g_updateConfig, updateLoaded)) {
+        update.updateChanged = true;
+    }
+    bool enabled = loaded.enabled;
     if (enabled != g_autarkMode) {
         update.modeChanged = true;
     }
@@ -642,7 +1389,484 @@ AutarkUpdate UpdateAutarkConfig(double now) {
     } else {
         g_autarkConfig = AutarkConfig{};
     }
+    g_updateConfig = updateLoaded;
+    g_updateUiConfig = uiLoaded;
+    if (update.updateChanged) {
+        if (g_updateConfig.enabled) {
+            Log(LOG_INFO, "Update config enabled. Source: " + g_updateConfig.source);
+        } else if (!g_updateConfig.source.empty()) {
+            Log(LOG_INFO, "Update config disabled. Source: " + g_updateConfig.source);
+        } else {
+            Log(LOG_INFO, "Update config disabled.");
+        }
+    }
     return update;
+}
+
+std::filesystem::path GetXPlaneRootPath() {
+    char path[512] = {};
+    XPLMGetSystemPath(path);
+    std::string root(path);
+    if (root.empty()) {
+        return std::filesystem::path();
+    }
+    return std::filesystem::path(root);
+}
+
+std::filesystem::path GetYalPluginPath() {
+    std::filesystem::path root = GetXPlaneRootPath();
+    if (root.empty()) {
+        return std::filesystem::path();
+    }
+    return root / "Resources" / "plugins" / "YAL";
+}
+
+std::string NormalizeRelPathForMatch(const std::string& rel) {
+    std::string out = rel;
+    for (char& c : out) {
+        if (c == '\\') {
+            c = '/';
+        }
+    }
+    if (out.rfind("./", 0) == 0) {
+        out.erase(0, 2);
+    }
+    while (!out.empty() && out.front() == '/') {
+        out.erase(out.begin());
+    }
+    return ToLower(out);
+}
+
+bool IsExcludedRelPath(const std::string& rel, const std::vector<std::string>& excludes) {
+    std::string normRel = NormalizeRelPathForMatch(rel);
+    if (normRel.empty()) {
+        return false;
+    }
+    std::filesystem::path relPath(normRel);
+    std::string baseName = ToLower(relPath.filename().string());
+    std::string ext = ToLower(relPath.extension().string());
+    std::string topLevel = normRel;
+    size_t slashPos = topLevel.find('/');
+    if (slashPos != std::string::npos) {
+        topLevel = topLevel.substr(0, slashPos);
+    }
+    for (const std::string& raw : excludes) {
+        std::string token = raw;
+        if (!token.empty() && token.front() == '/') {
+            size_t pos = token.find_first_not_of('/');
+            token = (pos == std::string::npos) ? "" : token.substr(pos);
+        }
+        std::string normEx = NormalizeRelPathForMatch(token);
+        if (normEx.empty()) {
+            continue;
+        }
+        if (normEx.find('/') == std::string::npos) {
+            if (!baseName.empty() && baseName == normEx) {
+                return true;
+            }
+            if (normEx.rfind("*.", 0) == 0 && !ext.empty()) {
+                std::string wantedExt = normEx.substr(1); // ".lua"
+                if (ext == wantedExt) {
+                    return true;
+                }
+            }
+            if (!topLevel.empty() && topLevel == normEx) {
+                return true;
+            }
+            continue;
+        }
+        if (normRel == normEx) {
+            return true;
+        }
+        if (normRel.size() > normEx.size() && normRel.compare(0, normEx.size(), normEx) == 0
+            && normRel[normEx.size()] == '/') {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ShouldCopyFile(const std::filesystem::path& src,
+    const std::filesystem::path& dst,
+    std::error_code* ec) {
+    std::error_code localEc;
+    std::error_code* useEc = ec ? ec : &localEc;
+    if (!std::filesystem::exists(dst, *useEc)) {
+        if (useEc) {
+            useEc->clear();
+        }
+        return true;
+    }
+    auto srcSize = std::filesystem::file_size(src, *useEc);
+    if (*useEc) {
+        useEc->clear();
+        return true;
+    }
+    auto dstSize = std::filesystem::file_size(dst, *useEc);
+    if (*useEc) {
+        useEc->clear();
+        return true;
+    }
+    if (srcSize != dstSize) {
+        return true;
+    }
+    auto srcTime = std::filesystem::last_write_time(src, *useEc);
+    if (*useEc) {
+        useEc->clear();
+        return true;
+    }
+    auto dstTime = std::filesystem::last_write_time(dst, *useEc);
+    if (*useEc) {
+        useEc->clear();
+        return true;
+    }
+    return srcTime > dstTime;
+}
+
+bool PerformUpdateJob(const HttpJob& job,
+    bool dryRun,
+    std::string* summary,
+    std::string* error,
+    std::vector<std::string>* logLines,
+    size_t* logOmitted,
+    UpdateCounters* counters) {
+    std::filesystem::path src(job.update_source);
+    std::filesystem::path dst(job.update_target);
+    if (logOmitted) {
+        *logOmitted = 0;
+    }
+    const bool logDetails = job.update_log_details && logLines && job.update_log_limit > 0;
+    const size_t logLimit = job.update_log_limit;
+    auto noteChange = [&](const std::string& prefix, const std::string& rel) {
+        if (!logDetails || !logLines) {
+            return;
+        }
+        if (logLines->size() < logLimit) {
+            logLines->push_back(prefix + rel);
+            return;
+        }
+        if (logOmitted) {
+            ++(*logOmitted);
+        }
+    };
+    if (src.empty()) {
+        if (error) {
+            *error = "Update source is empty";
+        }
+        return false;
+    }
+    if (dst.empty()) {
+        if (error) {
+            *error = "Update target is empty";
+        }
+        return false;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(src, ec) || ec) {
+        if (error) {
+            *error = BuildUpdatePathError("Update source not found", src, ec);
+        }
+        return false;
+    }
+    ec.clear();
+    if (!std::filesystem::is_directory(src, ec) || ec) {
+        if (error) {
+            *error = BuildUpdatePathError("Update source is not a directory", src, ec);
+        }
+        return false;
+    }
+    ec.clear();
+    if (!std::filesystem::exists(dst, ec) || ec) {
+        if (error) {
+            *error = BuildUpdatePathError("YAL plugin path not found", dst, ec);
+        }
+        return false;
+    }
+    ec.clear();
+    if (!std::filesystem::is_directory(dst, ec) || ec) {
+        if (error) {
+            *error = BuildUpdatePathError("YAL plugin path is not a directory", dst, ec);
+        }
+        return false;
+    }
+    ec.clear();
+    if (std::filesystem::equivalent(src, dst, ec) && !ec) {
+        if (summary) {
+            *summary = "Update source equals target; skipped";
+        }
+        return true;
+    }
+
+    size_t copied = 0;
+    size_t skipped = 0;
+    size_t dirsCreated = 0;
+    size_t failed = 0;
+    size_t deleted = 0;
+    size_t deleteFailed = 0;
+    const char* copyPrefix = dryRun ? "copy " : "copied ";
+    const char* deletePrefix = dryRun ? "delete " : "deleted ";
+    std::vector<std::pair<std::filesystem::path, std::filesystem::file_time_type>> sourceDirTimes;
+    const auto options = std::filesystem::directory_options::skip_permission_denied;
+    if (!dryRun) {
+        std::error_code rootTimeEc;
+        auto rootTime = std::filesystem::last_write_time(src, rootTimeEc);
+        if (!rootTimeEc) {
+            sourceDirTimes.emplace_back(std::filesystem::path("."), rootTime);
+        }
+    }
+    std::filesystem::recursive_directory_iterator it(src, options, ec);
+    std::filesystem::recursive_directory_iterator end;
+    while (it != end) {
+        if (ec) {
+            ec.clear();
+            it.increment(ec);
+            continue;
+        }
+        std::filesystem::path relPath = it->path().lexically_relative(src);
+        std::string rel = relPath.generic_string();
+        if (IsExcludedRelPath(rel, job.update_excludes)) {
+            if (it->is_directory()) {
+                it.disable_recursion_pending();
+            }
+            it.increment(ec);
+            continue;
+        }
+        std::filesystem::path dstPath = dst / relPath;
+        if (it->is_directory()) {
+            if (!dryRun) {
+                std::error_code dirTimeEc;
+                auto dirTime = std::filesystem::last_write_time(it->path(), dirTimeEc);
+                if (!dirTimeEc) {
+                    sourceDirTimes.emplace_back(relPath, dirTime);
+                }
+                std::filesystem::create_directories(dstPath, ec);
+                if (!ec) {
+                    ++dirsCreated;
+                } else {
+                    ec.clear();
+                    ++failed;
+                }
+            }
+            it.increment(ec);
+            continue;
+        }
+        if (!it->is_regular_file()) {
+            it.increment(ec);
+            continue;
+        }
+        if (!ShouldCopyFile(it->path(), dstPath, &ec)) {
+            if (ec) {
+                ec.clear();
+                ++failed;
+            } else {
+                ++skipped;
+            }
+            it.increment(ec);
+            continue;
+        }
+        if (dryRun) {
+            ++copied;
+            noteChange(copyPrefix, rel);
+            it.increment(ec);
+            continue;
+        }
+        std::filesystem::create_directories(dstPath.parent_path(), ec);
+        if (ec) {
+            ec.clear();
+        }
+        std::filesystem::copy_file(it->path(), dstPath, std::filesystem::copy_options::overwrite_existing, ec);
+        if (ec) {
+            ec.clear();
+            ++failed;
+        } else {
+            ++copied;
+            noteChange(copyPrefix, rel);
+            std::error_code timeEc;
+            auto srcTime = std::filesystem::last_write_time(it->path(), timeEc);
+            if (!timeEc) {
+                std::filesystem::last_write_time(dstPath, srcTime, timeEc);
+            }
+            if (timeEc) {
+                ++failed;
+            }
+        }
+        it.increment(ec);
+    }
+
+    ec.clear();
+    std::filesystem::recursive_directory_iterator dit(dst, options, ec);
+    while (dit != end) {
+        if (ec) {
+            ec.clear();
+            dit.increment(ec);
+            continue;
+        }
+        std::filesystem::path relPath = dit->path().lexically_relative(dst);
+        std::string rel = relPath.generic_string();
+        if (IsExcludedRelPath(rel, job.update_excludes)) {
+            if (dit->is_directory()) {
+                dit.disable_recursion_pending();
+            }
+            dit.increment(ec);
+            continue;
+        }
+        if (dit->is_directory()) {
+            dit.increment(ec);
+            continue;
+        }
+        if (!dit->is_regular_file()) {
+            dit.increment(ec);
+            continue;
+        }
+        std::filesystem::path srcPath = src / relPath;
+        std::error_code existsEc;
+        bool exists = std::filesystem::exists(srcPath, existsEc);
+        if (existsEc) {
+            ++deleteFailed;
+            ++failed;
+            existsEc.clear();
+            dit.increment(ec);
+            continue;
+        }
+        if (!exists) {
+            if (dryRun) {
+                ++deleted;
+                noteChange(deletePrefix, rel);
+            } else {
+                std::filesystem::remove(dit->path(), ec);
+                if (ec) {
+                    ++deleteFailed;
+                    ++failed;
+                    ec.clear();
+                } else {
+                    ++deleted;
+                    noteChange(deletePrefix, rel);
+                }
+            }
+        }
+        dit.increment(ec);
+    }
+
+    if (!dryRun) {
+        std::vector<std::filesystem::path> dirs;
+        ec.clear();
+        std::filesystem::recursive_directory_iterator dirIt(dst, options, ec);
+        while (dirIt != end) {
+            if (ec) {
+                ec.clear();
+                dirIt.increment(ec);
+                continue;
+            }
+            if (!dirIt->is_directory()) {
+                dirIt.increment(ec);
+                continue;
+            }
+            std::filesystem::path relPath = dirIt->path().lexically_relative(dst);
+            std::string rel = relPath.generic_string();
+            if (IsExcludedRelPath(rel, job.update_excludes)) {
+                dirIt.disable_recursion_pending();
+                dirIt.increment(ec);
+                continue;
+            }
+            dirs.push_back(dirIt->path());
+            dirIt.increment(ec);
+        }
+        std::sort(dirs.begin(), dirs.end(),
+            [](const std::filesystem::path& a, const std::filesystem::path& b) {
+                return a.native().size() > b.native().size();
+            });
+        for (const auto& dirPath : dirs) {
+            std::filesystem::path relPath = dirPath.lexically_relative(dst);
+            std::string rel = relPath.generic_string();
+            if (IsExcludedRelPath(rel, job.update_excludes)) {
+                continue;
+            }
+            std::filesystem::path srcPath = src / relPath;
+            std::error_code existsEc;
+            bool exists = std::filesystem::exists(srcPath, existsEc);
+            if (existsEc) {
+                ++deleteFailed;
+                ++failed;
+                existsEc.clear();
+                continue;
+            }
+            if (exists) {
+                continue;
+            }
+            std::error_code emptyEc;
+            if (!std::filesystem::is_empty(dirPath, emptyEc) || emptyEc) {
+                if (emptyEc) {
+                    ++deleteFailed;
+                    ++failed;
+                    emptyEc.clear();
+                }
+                continue;
+            }
+            std::filesystem::remove(dirPath, ec);
+            if (ec) {
+                ++deleteFailed;
+                ++failed;
+                ec.clear();
+            }
+        }
+
+        for (const auto& entry : sourceDirTimes) {
+            const std::filesystem::path& relPath = entry.first;
+            const auto& dirTime = entry.second;
+            std::filesystem::path dstPath;
+            if (relPath.empty() || relPath == ".") {
+                dstPath = dst;
+            } else {
+                dstPath = dst / relPath;
+            }
+            std::error_code timeEc;
+            if (!std::filesystem::exists(dstPath, timeEc) || timeEc) {
+                if (timeEc) {
+                    ++failed;
+                    timeEc.clear();
+                }
+                continue;
+            }
+            timeEc.clear();
+            if (!std::filesystem::is_directory(dstPath, timeEc) || timeEc) {
+                if (timeEc) {
+                    ++failed;
+                    timeEc.clear();
+                }
+                continue;
+            }
+            std::filesystem::last_write_time(dstPath, dirTime, timeEc);
+            if (timeEc) {
+                ++failed;
+                timeEc.clear();
+            }
+        }
+    }
+
+    if (summary) {
+        std::ostringstream ss;
+        if (dryRun) {
+            ss << "scan ";
+        }
+        ss << "copied=" << copied << " skipped=" << skipped << " dirs=" << dirsCreated
+           << " deleted=" << deleted << " del_failed=" << deleteFailed << " failed=" << failed;
+        *summary = ss.str();
+    }
+    if (counters) {
+        counters->copied = copied;
+        counters->skipped = skipped;
+        counters->dirs = dirsCreated;
+        counters->deleted = deleted;
+        counters->deleteFailed = deleteFailed;
+        counters->failed = failed;
+    }
+    if (failed > 0) {
+        if (error) {
+            *error = "Update completed with errors";
+        }
+        return false;
+    }
+    return true;
 }
 
 std::string GetActiveLogon() {
@@ -759,6 +1983,15 @@ void ResetOperationalState(double now) {
     g_commEstablished = false;
     g_sendPending = false;
     g_pollPending = false;
+    g_updatePending = false;
+    g_reloadAfterUpdate = false;
+    g_reloadAfterUpdateAt = 0.0;
+    g_updateScanPending = false;
+    g_updateDecisionPending = false;
+    g_reloadRequested = false;
+    g_updatePlanValid = false;
+    g_updateShowResultPopup = false;
+    HideUpdatePopup();
     SetDataRefBool(g_dref.comm_ready, false);
     g_loggedMissingRefs = false;
     g_loggedStartupSummary = false;
@@ -1350,6 +2583,29 @@ bool BuildPostFields(const HttpJob& job, std::string* out) {
 HttpResult RunHttpJob(const HttpJob& job) {
     HttpResult result;
     result.type = job.type;
+    if (job.type == JobType::Update || job.type == JobType::UpdateScan) {
+        std::string summary;
+        std::string err;
+        std::vector<std::string> updateLines;
+        size_t updateOmitted = 0;
+        UpdateCounters counts;
+        bool ok = PerformUpdateJob(
+            job,
+            job.type == JobType::UpdateScan,
+            &summary,
+            &err,
+            job.update_log_details ? &updateLines : nullptr,
+            job.update_log_details ? &updateOmitted : nullptr,
+            &counts);
+        result.ok = ok;
+        result.response = summary;
+        result.error = err;
+        result.httpCode = ok ? 200 : 0;
+        result.update_log_lines = std::move(updateLines);
+        result.update_log_omitted = updateOmitted;
+        result.update_counts = counts;
+        return result;
+    }
     std::string post;
     if (!BuildPostFields(job, &post)) {
         result.ok = false;
@@ -1556,6 +2812,8 @@ void DrainResults(bool allowDelivery) {
         if (!allowDelivery) {
             g_sendPending = false;
             g_pollPending = false;
+            g_updatePending = false;
+            g_reloadAfterUpdate = false;
             continue;
         }
         if (res.type == JobType::Send) {
@@ -1596,6 +2854,96 @@ void DrainResults(bool allowDelivery) {
             } else {
                 SetLastError("Poll failed: " + res.error);
                 SetLastHttp("poll: " + std::to_string(res.httpCode));
+            }
+        } else if (res.type == JobType::UpdateScan) {
+            g_updateScanPending = false;
+            if (!res.ok) {
+                LogAlways("Update scan failed: " + res.error);
+                g_updatePlanValid = false;
+                if (g_reloadRequested) {
+                    g_reloadRequested = false;
+                    TriggerReload("update scan failed");
+                }
+                continue;
+            }
+            std::string summary = Trim(res.response);
+            if (summary.empty()) {
+                summary = "ok";
+            }
+            LogAlways("Update scan ok: " + summary);
+            for (const auto& line : res.update_log_lines) {
+                LogAlways("Update scan " + line);
+            }
+            if (res.update_log_omitted > 0) {
+                std::string omitted =
+                    "... " + std::to_string(res.update_log_omitted) + " more changes not listed.";
+                LogAlways("Update scan " + omitted);
+            }
+
+            const size_t totalChanges =
+                res.update_counts.copied + res.update_counts.deleted + res.update_log_omitted;
+            if (totalChanges == 0) {
+                LogAlways("Update scan: no changes.");
+                g_updatePlanValid = false;
+                if (g_reloadRequested) {
+                    g_reloadRequested = false;
+                    TriggerReload("update no changes");
+                }
+                continue;
+            }
+            std::vector<std::string> popupLines;
+            std::ostringstream header;
+            header << "YAL update pending: " << res.update_counts.copied << " copy, "
+                   << res.update_counts.deleted << " delete";
+            if (res.update_log_omitted > 0) {
+                header << " (+" << res.update_log_omitted << " more)";
+            }
+            popupLines.push_back(header.str());
+            for (const auto& line : res.update_log_lines) {
+                popupLines.push_back(line);
+            }
+            if (res.update_log_omitted > 0) {
+                popupLines.push_back("... " + std::to_string(res.update_log_omitted)
+                    + " more changes not listed.");
+            }
+            g_updatePlanValid = true;
+            ShowUpdateConfirm(popupLines);
+        } else if (res.type == JobType::Update) {
+            g_updatePending = false;
+            bool showResultPopup = g_updateShowResultPopup;
+            g_updateShowResultPopup = false;
+            std::vector<std::string> popupLines;
+            if (res.ok) {
+                std::string summary = Trim(res.response);
+                if (summary.empty()) {
+                    summary = "ok";
+                }
+                LogAlways("Update ok: " + summary);
+            } else {
+                LogAlways("Update failed: " + res.error);
+                if (showResultPopup) {
+                    popupLines.push_back("YAL update failed: " + res.error);
+                }
+            }
+            for (const auto& line : res.update_log_lines) {
+                LogAlways("Update " + line);
+            }
+            if (res.update_log_omitted > 0) {
+                std::string omitted =
+                    "... " + std::to_string(res.update_log_omitted) + " more changes not listed.";
+                LogAlways("Update " + omitted);
+            }
+
+            if (showResultPopup && !popupLines.empty()) {
+                ShowUpdatePopup(popupLines);
+            }
+            if (g_reloadAfterUpdate) {
+                double now = XPLMGetElapsedTime();
+                if (g_updatePopupVisible && g_updatePopupMode == UpdatePopupMode::Info) {
+                    g_reloadAfterUpdateAt = g_updatePopupHideAt;
+                } else {
+                    g_reloadAfterUpdateAt = now;
+                }
             }
         }
     }
@@ -1654,6 +3002,32 @@ void UpdateCommReady(const std::string& logon, const std::string& callsign) {
     }
 }
 
+bool TriggerReload(const char* reason) {
+    if (!g_reloadCmd) {
+        g_reloadCmd = XPLMFindCommand("sasl/reload/YAL");
+        if (!g_reloadCmd) {
+            g_reloadCmd = XPLMFindCommand("sasl/reload/yal");
+        }
+        if (g_reloadCmd) {
+            g_loggedReloadCmdMissing = false;
+        }
+    }
+    if (!g_reloadCmd) {
+        if (!g_loggedReloadCmdMissing) {
+            g_loggedReloadCmdMissing = true;
+            Log(LOG_INFO, "Reload command not found (sasl/reload/YAL or sasl/reload/yal).");
+        }
+        return false;
+    }
+    std::string msg = "Reload requested";
+    if (reason && *reason) {
+        msg += " (" + std::string(reason) + ")";
+    }
+    Log(LOG_INFO, msg);
+    XPLMCommandOnce(g_reloadCmd);
+    return true;
+}
+
 bool HandleReloadRequest() {
     if (!g_dref.reload_request) {
         g_dref.reload_request = XPLMFindDataRef("YAL/command/reload");
@@ -1676,26 +3050,48 @@ bool HandleReloadRequest() {
         return false;
     }
     XPLMSetDatai(g_dref.reload_request, 0);
-    if (!g_reloadCmd) {
-        g_reloadCmd = XPLMFindCommand("sasl/reload/YAL");
-        if (!g_reloadCmd) {
-            g_reloadCmd = XPLMFindCommand("sasl/reload/yal");
+    if (g_updateConfig.enabled && !g_updateConfig.source.empty()) {
+        if (g_updateScanPending || g_updateDecisionPending || g_updatePending) {
+            g_reloadRequested = true;
+            Log(LOG_INFO, "Reload requested while update pending; will reload after update.");
+            return true;
         }
-    }
-    if (!g_reloadCmd) {
-        if (!g_loggedReloadCmdMissing) {
-            g_loggedReloadCmdMissing = true;
-            Log(LOG_INFO, "Reload command not found (sasl/reload/YAL or sasl/reload/yal).");
+        std::filesystem::path target = GetYalPluginPath();
+        if (target.empty()) {
+            Log(LOG_ERR, "Update skipped: YAL plugin path not found.");
+            return TriggerReload("update skipped");
         }
-        return false;
+        HttpJob job;
+        job.type = JobType::UpdateScan;
+        job.update_source = g_updateConfig.source;
+        job.update_target = target.string();
+        job.update_excludes = g_updateConfig.excludes;
+        job.update_log_details = true;
+        job.update_log_limit = kUpdateLogMaxEntries;
+        EnqueueJob(job);
+        g_updateScanPending = true;
+        g_reloadRequested = true;
+        g_updatePlanConfig = g_updateConfig;
+        g_updatePlanTarget = target.string();
+        g_updatePlanValid = true;
+        Log(LOG_INFO, "Update scan scheduled from " + g_updateConfig.source);
+        return true;
     }
-    Log(LOG_INFO, "Reload requested via YAL/command/reload.");
-    XPLMCommandOnce(g_reloadCmd);
-    return true;
+    return TriggerReload("dataref");
 }
 
 float FlightLoopCallback(float, float, int, void*) {
     double now = XPLMGetElapsedTime();
+    UpdatePopupVisibility(now);
+    if (g_updateDecisionPending && g_updatePopupMode == UpdatePopupMode::Confirm
+        && now >= g_updateDecisionDeadline) {
+        HandleUpdateDecision(true, "timeout");
+    }
+    if (g_reloadAfterUpdate && g_reloadAfterUpdateAt > 0.0 && now >= g_reloadAfterUpdateAt) {
+        g_reloadAfterUpdate = false;
+        g_reloadAfterUpdateAt = 0.0;
+        TriggerReload("post-update");
+    }
     AutarkUpdate autarkUpdate = UpdateAutarkConfig(now);
     g_debugLevel = GetDebugLevel();
     if (autarkUpdate.modeChanged) {
@@ -1758,9 +3154,7 @@ float FlightLoopCallback(float, float, int, void*) {
     LogPollModeChange();
     bool prereqsOk = AreCommPrereqsReady(logon, callsign, nullptr);
 
-    bool jobPending = g_sendPending || g_pollPending;
-
-    if (!jobPending && commReady) {
+    if (!g_sendPending && !g_updatePending && commReady) {
         std::string to = Trim(GetDataRefString(g_dref.send_message_to));
         std::string type = Trim(GetDataRefString(g_dref.send_message_type));
         std::string packet = Trim(GetDataRefString(g_dref.send_message_packet));
@@ -1795,11 +3189,11 @@ float FlightLoopCallback(float, float, int, void*) {
             job.packet = packet;
             EnqueueJob(job);
             g_sendPending = true;
-            jobPending = true;
             ScheduleNextPollTime(now);
         }
     }
 
+    bool jobPending = g_sendPending || g_pollPending || g_updatePending;
     if (!jobPending && prereqsOk && (!commReady || now >= g_nextPollTime)) {
         HttpJob job;
         job.type = JobType::Poll;
@@ -2037,6 +3431,23 @@ PLUGIN_API void XPluginDisable() {
     g_autarkConfig = AutarkConfig{};
     g_autarkAppliedCallsign.clear();
     g_nextPrefScanTime = 0.0;
+    if (g_updateWindow) {
+        SaveUpdateWindowPosition();
+        XPLMDestroyWindow(g_updateWindow);
+        g_updateWindow = nullptr;
+    }
+    g_updatePopupVisible = false;
+    g_updatePopupHideAt = 0.0;
+    g_updatePopupLines.clear();
+    g_updatePopupMode = UpdatePopupMode::None;
+    g_updateButtonsValid = false;
+    g_updatePopupButtonArea = 0;
+    g_updateDecisionPending = false;
+    g_updateDecisionDeadline = 0.0;
+    g_updateScanPending = false;
+    g_reloadRequested = false;
+    g_updateShowResultPopup = false;
+    g_updatePlanValid = false;
     SetStatus("DISABLED");
     Log(LOG_INFO, "Disabled");
 }
