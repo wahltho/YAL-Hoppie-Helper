@@ -25,6 +25,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -983,6 +984,160 @@ std::string ToLower(const std::string& s) {
     return out;
 }
 
+struct UpdateTreeNode {
+    std::string name;
+    bool isFile = false;
+    std::vector<std::string> actions;
+    std::map<std::string, UpdateTreeNode> children;
+};
+
+bool ParseUpdateLogLine(const std::string& line, std::string* action, std::string* path) {
+    if (!action || !path) {
+        return false;
+    }
+    std::string trimmed = Trim(line);
+    if (trimmed.rfind("copy ", 0) == 0) {
+        *action = "copy";
+        *path = Trim(trimmed.substr(5));
+        return true;
+    }
+    if (trimmed.rfind("delete ", 0) == 0) {
+        *action = "delete";
+        *path = Trim(trimmed.substr(7));
+        return true;
+    }
+    if (trimmed.rfind("dir_ts ", 0) == 0) {
+        *action = "dir_ts";
+        *path = Trim(trimmed.substr(7));
+        return true;
+    }
+    return false;
+}
+
+void SplitPathComponents(const std::string& path, std::vector<std::string>* parts) {
+    if (!parts) {
+        return;
+    }
+    parts->clear();
+    size_t start = 0;
+    while (start < path.size()) {
+        size_t pos = path.find('/', start);
+        std::string part = (pos == std::string::npos) ? path.substr(start) : path.substr(start, pos - start);
+        if (!part.empty() && part != ".") {
+            parts->push_back(part);
+        }
+        if (pos == std::string::npos) {
+            break;
+        }
+        start = pos + 1;
+    }
+}
+
+void AddUpdateAction(UpdateTreeNode* node, const std::string& action) {
+    if (!node) {
+        return;
+    }
+    for (const auto& existing : node->actions) {
+        if (existing == action) {
+            return;
+        }
+    }
+    node->actions.push_back(action);
+}
+
+std::string JoinActions(const std::vector<std::string>& actions) {
+    std::ostringstream oss;
+    for (size_t i = 0; i < actions.size(); ++i) {
+        if (i > 0) {
+            oss << ", ";
+        }
+        oss << actions[i];
+    }
+    return oss.str();
+}
+
+void BuildUpdateTreeLines(const UpdateTreeNode& node, int depth, std::vector<std::string>* out) {
+    if (!out) {
+        return;
+    }
+    std::vector<const UpdateTreeNode*> ordered;
+    ordered.reserve(node.children.size());
+    for (const auto& kv : node.children) {
+        ordered.push_back(&kv.second);
+    }
+    std::sort(ordered.begin(), ordered.end(),
+        [](const UpdateTreeNode* a, const UpdateTreeNode* b) {
+            bool aDir = !a->isFile || !a->children.empty();
+            bool bDir = !b->isFile || !b->children.empty();
+            if (aDir != bDir) {
+                return aDir > bDir;
+            }
+            return a->name < b->name;
+        });
+    for (const auto* child : ordered) {
+        std::string line(static_cast<size_t>(depth) * 2, ' ');
+        line += child->name;
+        if (!child->actions.empty()) {
+            line += " [" + JoinActions(child->actions) + "]";
+        }
+        out->push_back(line);
+        if (!child->children.empty()) {
+            BuildUpdateTreeLines(*child, depth + 1, out);
+        }
+    }
+}
+
+std::vector<std::string> BuildUpdateHierarchyLines(const std::vector<std::string>& lines) {
+    UpdateTreeNode root;
+    std::vector<std::string> unknown;
+    std::vector<std::string> parts;
+    for (const auto& line : lines) {
+        std::string action;
+        std::string path;
+        if (!ParseUpdateLogLine(line, &action, &path)) {
+            unknown.push_back(line);
+            continue;
+        }
+        if (path.empty() || path == ".") {
+            AddUpdateAction(&root, action);
+            continue;
+        }
+        SplitPathComponents(path, &parts);
+        if (parts.empty()) {
+            AddUpdateAction(&root, action);
+            continue;
+        }
+        UpdateTreeNode* node = &root;
+        for (const auto& part : parts) {
+            auto it = node->children.find(part);
+            if (it == node->children.end()) {
+                UpdateTreeNode child;
+                child.name = part;
+                it = node->children.emplace(part, std::move(child)).first;
+            }
+            node = &it->second;
+        }
+        if (action == "dir_ts") {
+            AddUpdateAction(node, action);
+        } else {
+            node->isFile = true;
+            AddUpdateAction(node, action);
+        }
+    }
+
+    std::vector<std::string> out;
+    if (!root.actions.empty() && root.children.empty()) {
+        std::string line = "root";
+        line += " [" + JoinActions(root.actions) + "]";
+        out.push_back(line);
+    }
+    BuildUpdateTreeLines(root, 0, &out);
+    for (const auto& line : unknown) {
+        out.push_back(line);
+    }
+    return out;
+}
+
 #ifdef _WIN32
 std::string GetWin32ErrorMessage(DWORD code) {
     if (code == 0) {
@@ -1438,6 +1593,101 @@ bool WinSetLastWriteTime(const std::filesystem::path& path, const FILETIME& ft, 
         return false;
     }
     return true;
+}
+
+std::string FormatWinAttributes(DWORD attrs) {
+    std::ostringstream oss;
+    oss << "0x" << std::hex << std::uppercase << attrs;
+    return oss.str();
+}
+
+bool EnablePrivilege(const char* name, std::string* error) {
+    HANDLE token = nullptr;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &token)) {
+        DWORD winerr = GetLastError();
+        if (error) {
+            std::string msg = GetWin32ErrorMessage(winerr);
+            std::ostringstream oss;
+            oss << "OpenProcessToken failed (win=" << winerr;
+            if (!msg.empty()) {
+                oss << ": " << msg;
+            }
+            oss << ")";
+            *error = oss.str();
+        }
+        return false;
+    }
+    LUID luid{};
+    if (!LookupPrivilegeValueA(nullptr, name, &luid)) {
+        DWORD winerr = GetLastError();
+        CloseHandle(token);
+        if (error) {
+            std::string msg = GetWin32ErrorMessage(winerr);
+            std::ostringstream oss;
+            oss << "LookupPrivilegeValue failed (win=" << winerr;
+            if (!msg.empty()) {
+                oss << ": " << msg;
+            }
+            oss << ")";
+            *error = oss.str();
+        }
+        return false;
+    }
+    TOKEN_PRIVILEGES tp{};
+    tp.PrivilegeCount = 1;
+    tp.Privileges[0].Luid = luid;
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+    if (!AdjustTokenPrivileges(token, FALSE, &tp, sizeof(tp), nullptr, nullptr)) {
+        DWORD winerr = GetLastError();
+        CloseHandle(token);
+        if (error) {
+            std::string msg = GetWin32ErrorMessage(winerr);
+            std::ostringstream oss;
+            oss << "AdjustTokenPrivileges failed (win=" << winerr;
+            if (!msg.empty()) {
+                oss << ": " << msg;
+            }
+            oss << ")";
+            *error = oss.str();
+        }
+        return false;
+    }
+    DWORD winerr = GetLastError();
+    CloseHandle(token);
+    if (winerr == ERROR_NOT_ALL_ASSIGNED) {
+        if (error) {
+            *error = "AdjustTokenPrivileges: privilege not assigned";
+        }
+        return false;
+    }
+    return true;
+}
+
+void EnsureUpdatePrivileges() {
+    static bool attempted = false;
+    if (attempted) {
+        return;
+    }
+    attempted = true;
+    std::string restoreErr;
+    std::string backupErr;
+    bool okRestore = EnablePrivilege(SE_RESTORE_NAME, &restoreErr);
+    bool okBackup = EnablePrivilege(SE_BACKUP_NAME, &backupErr);
+    if (!okRestore || !okBackup) {
+        std::string msg = "Update privileges: ";
+        msg += okRestore ? "SeRestore ok" : "SeRestore failed";
+        if (!okRestore && !restoreErr.empty()) {
+            msg += " (" + restoreErr + ")";
+        }
+        msg += ", ";
+        msg += okBackup ? "SeBackup ok" : "SeBackup failed";
+        if (!okBackup && !backupErr.empty()) {
+            msg += " (" + backupErr + ")";
+        }
+        Log(LOG_INFO, msg);
+    } else {
+        Log(LOG_INFO, "Update privileges enabled (SeRestore, SeBackup).");
+    }
 }
 
 bool WinEnumerateUpdateSource(const std::filesystem::path& src,
@@ -2265,21 +2515,21 @@ bool PerformUpdateJob(const HttpJob& job,
                 if (!CopyFileW(entry.abs.wstring().c_str(), dstPath.wstring().c_str(), FALSE)) {
                     ++failed;
                     ++copyErrors;
-            if (copyErrors == 1) {
-                DWORD winerr = GetLastError();
-                std::string msg = GetWin32ErrorMessage(winerr);
-                std::ostringstream oss;
+                    if (copyErrors == 1) {
+                        DWORD winerr = GetLastError();
+                        std::string msg = GetWin32ErrorMessage(winerr);
+                        std::ostringstream oss;
                         oss << entry.relStr << " (win=" << winerr;
                         if (!msg.empty()) {
                             oss << ": " << msg;
+                        }
+                        oss << ")";
+                        firstCopyError = oss.str();
+                        recordFailure("copy " + entry.relStr + " (win=" + std::to_string(winerr)
+                            + (msg.empty() ? "" : ": " + msg) + ")");
+                    }
+                    continue;
                 }
-                oss << ")";
-                firstCopyError = oss.str();
-                recordFailure("copy " + entry.relStr + " (win=" + std::to_string(winerr)
-                    + (msg.empty() ? "" : ": " + msg) + ")");
-            }
-            continue;
-        }
                 ++copied;
                 noteChange(copyPrefix, entry.relStr);
                 std::string winTimeError;
@@ -2337,67 +2587,89 @@ bool PerformUpdateJob(const HttpJob& job,
 
     if (dryRun) {
 #ifdef _WIN32
-        if (usedWinFallback) {
-            for (const auto& entry : sourceDirTimesWin) {
-                const std::filesystem::path& relPath = entry.first;
-                std::filesystem::path dstPath;
-                if (relPath.empty() || relPath == ".") {
-                    dstPath = dst;
-                } else {
-                    dstPath = dst / relPath;
-                }
-                WinFileInfo dstInfo;
-                if (!WinGetFileInfo(dstPath, &dstInfo, nullptr)) {
-                    noteDirTimeChange(relPath);
-                    continue;
-                }
-                if (!dstInfo.exists || !dstInfo.isDir) {
-                    noteDirTimeChange(relPath);
-                    continue;
-                }
-                if (CompareFileTime(&entry.second, &dstInfo.writeTime) != 0) {
-                    noteDirTimeChange(relPath);
-                }
+        auto getSourceDirTimeWin = [&](const std::filesystem::path& relPath, FILETIME* out) -> bool {
+            if (!out) {
+                return false;
             }
-        } else
-#endif
-        {
+            std::filesystem::path srcPath;
+            if (relPath.empty() || relPath == ".") {
+                srcPath = src;
+            } else {
+                srcPath = src / relPath;
+            }
+            WinFileInfo srcInfo;
+            if (!WinGetFileInfo(srcPath, &srcInfo, nullptr) || !srcInfo.exists || !srcInfo.isDir) {
+                return false;
+            }
+            *out = srcInfo.writeTime;
+            return true;
+        };
+        auto checkDirTimeWin = [&](const std::filesystem::path& relPath) {
+            FILETIME srcTime{};
+            if (!getSourceDirTimeWin(relPath, &srcTime)) {
+                noteDirTimeChange(relPath);
+                return;
+            }
+            std::filesystem::path dstPath = (relPath.empty() || relPath == ".") ? dst : (dst / relPath);
+            WinFileInfo dstInfo;
+            if (!WinGetFileInfo(dstPath, &dstInfo, nullptr)) {
+                noteDirTimeChange(relPath);
+                return;
+            }
+            if (!dstInfo.exists || !dstInfo.isDir) {
+                noteDirTimeChange(relPath);
+                return;
+            }
+            if (CompareFileTime(&srcTime, &dstInfo.writeTime) != 0) {
+                noteDirTimeChange(relPath);
+            }
+        };
+        if (usedWinFallback && !sourceDirTimesWin.empty()) {
+            for (const auto& entry : sourceDirTimesWin) {
+                checkDirTimeWin(entry.first);
+            }
+        } else {
             for (const auto& entry : sourceDirTimes) {
-                const std::filesystem::path& relPath = entry.first;
-                const auto& dirTime = entry.second;
-                std::filesystem::path dstPath;
-                if (relPath.empty() || relPath == ".") {
-                    dstPath = dst;
-                } else {
-                    dstPath = dst / relPath;
-                }
-                std::error_code timeEc;
-                if (!std::filesystem::exists(dstPath, timeEc) || timeEc) {
-                    if (timeEc) {
-                        timeEc.clear();
-                    }
-                    noteDirTimeChange(relPath);
-                    continue;
-                }
-                timeEc.clear();
-                if (!std::filesystem::is_directory(dstPath, timeEc) || timeEc) {
-                    if (timeEc) {
-                        timeEc.clear();
-                    }
-                    noteDirTimeChange(relPath);
-                    continue;
-                }
-                auto dstTime = std::filesystem::last_write_time(dstPath, timeEc);
-                if (timeEc) {
-                    timeEc.clear();
-                    noteDirTimeChange(relPath);
-                    continue;
-                }
-                if (dirTime != dstTime) {
-                    noteDirTimeChange(relPath);
-                }
+                checkDirTimeWin(entry.first);
             }
         }
+#else
+        for (const auto& entry : sourceDirTimes) {
+            const std::filesystem::path& relPath = entry.first;
+            const auto& dirTime = entry.second;
+            std::filesystem::path dstPath;
+            if (relPath.empty() || relPath == ".") {
+                dstPath = dst;
+            } else {
+                dstPath = dst / relPath;
+            }
+            std::error_code timeEc;
+            if (!std::filesystem::exists(dstPath, timeEc) || timeEc) {
+                if (timeEc) {
+                    timeEc.clear();
+                }
+                noteDirTimeChange(relPath);
+                continue;
+            }
+            timeEc.clear();
+            if (!std::filesystem::is_directory(dstPath, timeEc) || timeEc) {
+                if (timeEc) {
+                    timeEc.clear();
+                }
+                noteDirTimeChange(relPath);
+                continue;
+            }
+            auto dstTime = std::filesystem::last_write_time(dstPath, timeEc);
+            if (timeEc) {
+                timeEc.clear();
+                noteDirTimeChange(relPath);
+                continue;
+            }
+            if (dirTime != dstTime) {
+                noteDirTimeChange(relPath);
+            }
+        }
+#endif
     }
 
     ec.clear();
@@ -2530,40 +2802,55 @@ bool PerformUpdateJob(const HttpJob& job,
             [](const auto& a, const auto& b) {
                 return a.first.native().size() > b.first.native().size();
             });
-#endif
-
-#ifdef _WIN32
-        if (usedWinFallback) {
-            for (const auto& entry : sourceDirTimesWin) {
-                const std::filesystem::path& relPath = entry.first;
-                std::filesystem::path dstPath;
-                if (relPath.empty() || relPath == ".") {
-                    dstPath = dst;
+        EnsureUpdatePrivileges();
+        auto setDirTimeWin = [&](const std::filesystem::path& relPath) {
+            std::filesystem::path srcPath = (relPath.empty() || relPath == ".") ? src : (src / relPath);
+            WinFileInfo srcInfo;
+            std::string srcErr;
+            if (!WinGetFileInfo(srcPath, &srcInfo, &srcErr) || !srcInfo.exists || !srcInfo.isDir) {
+                ++failed;
+                if (!srcErr.empty()) {
+                    recordFailure("timestamp_dir " + relPath.generic_string() + " (" + srcErr + ")");
                 } else {
-                    dstPath = dst / relPath;
+                    recordFailure("timestamp_dir " + relPath.generic_string() + " (source info failed)");
                 }
-                WinFileInfo dstInfo;
-                if (!WinGetFileInfo(dstPath, &dstInfo, nullptr)) {
-                    ++failed;
-                    continue;
-                }
-                if (!dstInfo.exists || !dstInfo.isDir) {
-                    continue;
-                }
-                std::string winTimeError;
-                if (!WinSetLastWriteTime(dstPath, entry.second, true, &winTimeError)) {
-                    ++failed;
-                    if (!winTimeError.empty()) {
-                        recordFailure("timestamp_dir " + relPath.generic_string() + " (" + winTimeError + ")");
-                    } else {
-                        recordFailure("timestamp_dir " + relPath.generic_string() + " (win error)");
-                    }
-                } else {
-                    ++dirTs;
-                }
+                return;
             }
-        } else
-#endif
+            std::filesystem::path dstPath = (relPath.empty() || relPath == ".") ? dst : (dst / relPath);
+            WinFileInfo dstInfo;
+            std::string dstErr;
+            if (!WinGetFileInfo(dstPath, &dstInfo, &dstErr)) {
+                ++failed;
+                if (!dstErr.empty()) {
+                    recordFailure("timestamp_dir " + relPath.generic_string() + " (" + dstErr + ")");
+                } else {
+                    recordFailure("timestamp_dir " + relPath.generic_string() + " (dest info failed)");
+                }
+                return;
+            }
+            if (!dstInfo.exists || !dstInfo.isDir) {
+                return;
+            }
+            std::string winTimeError;
+            if (!WinSetLastWriteTime(dstPath, srcInfo.writeTime, true, &winTimeError)) {
+                ++failed;
+                std::string msg = winTimeError.empty() ? "win error" : winTimeError;
+                msg += " attrs=" + FormatWinAttributes(dstInfo.attrs);
+                recordFailure("timestamp_dir " + relPath.generic_string() + " (" + msg + ")");
+                return;
+            }
+            ++dirTs;
+        };
+        if (usedWinFallback && !sourceDirTimesWin.empty()) {
+            for (const auto& entry : sourceDirTimesWin) {
+                setDirTimeWin(entry.first);
+            }
+        } else {
+            for (const auto& entry : sourceDirTimes) {
+                setDirTimeWin(entry.first);
+            }
+        }
+#else
         {
             for (const auto& entry : sourceDirTimes) {
                 const std::filesystem::path& relPath = entry.first;
@@ -2592,23 +2879,6 @@ bool PerformUpdateJob(const HttpJob& job,
                 }
                 std::filesystem::last_write_time(dstPath, dirTime, timeEc);
                 if (timeEc) {
-#ifdef _WIN32
-                    std::filesystem::path srcPath;
-                    if (relPath.empty() || relPath == ".") {
-                        srcPath = src;
-                    } else {
-                        srcPath = src / relPath;
-                    }
-                    WinFileInfo srcInfo;
-                    std::string winTimeError;
-                    if (WinGetFileInfo(srcPath, &srcInfo, nullptr) && srcInfo.exists && srcInfo.isDir) {
-                        if (WinSetLastWriteTime(dstPath, srcInfo.writeTime, true, &winTimeError)) {
-                            ++dirTs;
-                            timeEc.clear();
-                            continue;
-                        }
-                    }
-#endif
                     recordFailure("timestamp_dir " + relPath.generic_string()
                         + " (ec=" + formatEc(timeEc) + ")");
                     ++failed;
@@ -2618,6 +2888,7 @@ bool PerformUpdateJob(const HttpJob& job,
                 }
             }
         }
+#endif
     }
 
     if (summary) {
@@ -3691,7 +3962,8 @@ void DrainResults(bool allowDelivery) {
                 header << " (+" << res.update_log_omitted << " more)";
             }
             popupLines.push_back(header.str());
-            for (const auto& line : res.update_log_lines) {
+            std::vector<std::string> treeLines = BuildUpdateHierarchyLines(res.update_log_lines);
+            for (const auto& line : treeLines) {
                 popupLines.push_back(line);
             }
             if (res.update_log_omitted > 0) {
