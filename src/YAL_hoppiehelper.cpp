@@ -15,13 +15,16 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cwchar>
 #include <condition_variable>
 #include <cctype>
 #include <deque>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <mutex>
 #include <queue>
 #include <random>
@@ -139,6 +142,7 @@ struct UpdateCounters {
     size_t deleted = 0;
     size_t deleteFailed = 0;
     size_t failed = 0;
+    size_t dir_ts = 0;
 };
 
 struct HttpJob {
@@ -217,7 +221,7 @@ bool g_tailnumKnown = false;
 bool g_lastTailnumMatches = false;
 std::string g_lastTailnum;
 
-enum class UpdatePopupMode { None, Info, Confirm };
+enum class UpdatePopupMode { None, Info, Confirm, Error };
 
 struct UiRect {
     int left = 0;
@@ -237,6 +241,9 @@ UiRect g_updateButtonAbort;
 int g_updatePopupButtonArea = 0;
 bool g_updateDecisionPending = false;
 double g_updateDecisionDeadline = 0.0;
+bool g_updateErrorPending = false;
+bool g_reloadAfterErrorAck = false;
+std::string g_updateErrorReloadReason;
 bool g_updateScanPending = false;
 bool g_reloadRequested = false;
 bool g_updateShowResultPopup = false;
@@ -336,6 +343,7 @@ bool ParseLegacyOutboxMessage(const std::string& raw, LegacyOutboxMessage* out);
 void QueueInboundMessage(const std::string& origin, const std::string& raw);
 void DeliverQueuedInboxIfEmpty();
 void EnqueueJob(const HttpJob& job);
+bool IsExcludedRelPath(const std::string& rel, const std::vector<std::string>& excludes);
 bool PerformUpdateJob(const HttpJob& job,
     bool dryRun,
     std::string* summary,
@@ -346,11 +354,14 @@ bool PerformUpdateJob(const HttpJob& job,
 void EnsureUpdateWindow();
 void ShowUpdatePopup(const std::vector<std::string>& lines);
 void ShowUpdateConfirm(const std::vector<std::string>& lines);
+void ShowUpdateError(const std::vector<std::string>& lines, const char* reloadReason);
+void UpdatePopupButtonRectsFromWindow(int left, int top, int right, int bottom);
 void UpdatePopupVisibility(double now);
 void HideUpdatePopup();
 void SaveUpdateWindowPosition();
 bool WriteUpdateWindowPos(int left, int top);
 void HandleUpdateDecision(bool accept, const char* reason);
+void HandleUpdateErrorAck(const char* reason);
 bool StartUpdateFromPlan(const char* reason);
 
 void Log(LogLevel level, const std::string& msg) {
@@ -374,16 +385,29 @@ int UpdateWindowHandleMouseClick(XPLMWindowID, int x, int y, XPLMMouseStatus sta
     if (status != xplm_MouseDown) {
         return 0;
     }
-    if (g_updatePopupMode != UpdatePopupMode::Confirm || !g_updateDecisionPending || !g_updateButtonsValid) {
-        return 0;
+    if (g_updatePopupMode == UpdatePopupMode::Confirm || g_updatePopupMode == UpdatePopupMode::Error) {
+        int left = 0;
+        int top = 0;
+        int right = 0;
+        int bottom = 0;
+        XPLMGetWindowGeometry(g_updateWindow, &left, &top, &right, &bottom);
+        UpdatePopupButtonRectsFromWindow(left, top, right, bottom);
     }
-    if (PointInRect(x, y, g_updateButtonOk)) {
-        HandleUpdateDecision(true, "ok");
-        return 1;
+    if (g_updatePopupMode == UpdatePopupMode::Confirm && g_updateDecisionPending && g_updateButtonsValid) {
+        if (PointInRect(x, y, g_updateButtonOk)) {
+            HandleUpdateDecision(true, "ok");
+            return 1;
+        }
+        if (PointInRect(x, y, g_updateButtonAbort)) {
+            HandleUpdateDecision(false, "abort");
+            return 1;
+        }
     }
-    if (PointInRect(x, y, g_updateButtonAbort)) {
-        HandleUpdateDecision(false, "abort");
-        return 1;
+    if (g_updatePopupMode == UpdatePopupMode::Error && g_updateErrorPending && g_updateButtonsValid) {
+        if (PointInRect(x, y, g_updateButtonOk)) {
+            HandleUpdateErrorAck("ok");
+            return 1;
+        }
     }
     return 0;
 }
@@ -403,6 +427,28 @@ XPLMCursorStatus UpdateWindowHandleCursor(XPLMWindowID, int, int, void*) {
 void UpdateWindowHandleKey(XPLMWindowID, char, XPLMKeyFlags, char, void*, int) {
 }
 
+void UpdatePopupButtonRectsFromWindow(int left, int top, int right, int bottom) {
+    if (g_updatePopupMode == UpdatePopupMode::Confirm) {
+        int buttonBottom = bottom + kUpdatePopupPadding;
+        int buttonTop = buttonBottom + kUpdateButtonHeight;
+        int okRight = right - kUpdatePopupPadding;
+        int okLeft = okRight - kUpdateButtonWidth;
+        int abortRight = okLeft - kUpdateButtonGap;
+        int abortLeft = abortRight - kUpdateButtonWidth;
+        g_updateButtonOk = {okLeft, buttonTop, okRight, buttonBottom};
+        g_updateButtonAbort = {abortLeft, buttonTop, abortRight, buttonBottom};
+        g_updateButtonsValid = true;
+    } else if (g_updatePopupMode == UpdatePopupMode::Error) {
+        int buttonBottom = bottom + kUpdatePopupPadding;
+        int buttonTop = buttonBottom + kUpdateButtonHeight;
+        int width = right - left;
+        int okLeft = left + (width - kUpdateButtonWidth) / 2;
+        int okRight = okLeft + kUpdateButtonWidth;
+        g_updateButtonOk = {okLeft, buttonTop, okRight, buttonBottom};
+        g_updateButtonsValid = true;
+    }
+}
+
 void UpdateWindowDraw(XPLMWindowID windowId, void*) {
     if (!g_updatePopupVisible || g_updatePopupLines.empty()) {
         return;
@@ -412,6 +458,9 @@ void UpdateWindowDraw(XPLMWindowID windowId, void*) {
     int right = 0;
     int bottom = 0;
     XPLMGetWindowGeometry(windowId, &left, &top, &right, &bottom);
+    if (g_updatePopupMode == UpdatePopupMode::Confirm || g_updatePopupMode == UpdatePopupMode::Error) {
+        UpdatePopupButtonRectsFromWindow(left, top, right, bottom);
+    }
     XPLMDrawTranslucentDarkBox(left, top, right, bottom);
 
     int charWidth = 0;
@@ -423,7 +472,7 @@ void UpdateWindowDraw(XPLMWindowID windowId, void*) {
     int y = top - kUpdatePopupPadding - charHeight;
     float color[] = {1.0f, 1.0f, 1.0f};
     int bottomLimit = bottom + kUpdatePopupPadding;
-    if (g_updatePopupMode == UpdatePopupMode::Confirm) {
+    if (g_updatePopupMode == UpdatePopupMode::Confirm || g_updatePopupMode == UpdatePopupMode::Error) {
         bottomLimit += g_updatePopupButtonArea;
     }
     for (const auto& line : g_updatePopupLines) {
@@ -434,23 +483,34 @@ void UpdateWindowDraw(XPLMWindowID windowId, void*) {
         }
     }
 
-    if (g_updatePopupMode == UpdatePopupMode::Confirm && g_updateButtonsValid) {
-        XPLMDrawTranslucentDarkBox(
-            g_updateButtonOk.left, g_updateButtonOk.top, g_updateButtonOk.right, g_updateButtonOk.bottom);
-        XPLMDrawTranslucentDarkBox(
-            g_updateButtonAbort.left, g_updateButtonAbort.top, g_updateButtonAbort.right, g_updateButtonAbort.bottom);
+    if (g_updateButtonsValid) {
+        if (g_updatePopupMode == UpdatePopupMode::Confirm) {
+            XPLMDrawTranslucentDarkBox(
+                g_updateButtonOk.left, g_updateButtonOk.top, g_updateButtonOk.right, g_updateButtonOk.bottom);
+            XPLMDrawTranslucentDarkBox(
+                g_updateButtonAbort.left, g_updateButtonAbort.top, g_updateButtonAbort.right, g_updateButtonAbort.bottom);
 
-        const char* okText = "OK";
-        const char* abortText = "ABORT";
-        int okTextWidth = static_cast<int>(std::strlen(okText)) * charWidth;
-        int abortTextWidth = static_cast<int>(std::strlen(abortText)) * charWidth;
-        int okX = g_updateButtonOk.left + (g_updateButtonOk.right - g_updateButtonOk.left - okTextWidth) / 2;
-        int abortX =
-            g_updateButtonAbort.left + (g_updateButtonAbort.right - g_updateButtonAbort.left - abortTextWidth) / 2;
-        int textY = g_updateButtonOk.bottom + (kUpdateButtonHeight - charHeight) / 2;
-        float buttonColor[] = {0.9f, 0.9f, 0.9f};
-        XPLMDrawString(buttonColor, okX, textY, const_cast<char*>(okText), nullptr, xplmFont_Basic);
-        XPLMDrawString(buttonColor, abortX, textY, const_cast<char*>(abortText), nullptr, xplmFont_Basic);
+            const char* okText = "OK";
+            const char* abortText = "ABORT";
+            int okTextWidth = static_cast<int>(std::strlen(okText)) * charWidth;
+            int abortTextWidth = static_cast<int>(std::strlen(abortText)) * charWidth;
+            int okX = g_updateButtonOk.left + (g_updateButtonOk.right - g_updateButtonOk.left - okTextWidth) / 2;
+            int abortX =
+                g_updateButtonAbort.left + (g_updateButtonAbort.right - g_updateButtonAbort.left - abortTextWidth) / 2;
+            int textY = g_updateButtonOk.bottom + (kUpdateButtonHeight - charHeight) / 2;
+            float buttonColor[] = {0.9f, 0.9f, 0.9f};
+            XPLMDrawString(buttonColor, okX, textY, const_cast<char*>(okText), nullptr, xplmFont_Basic);
+            XPLMDrawString(buttonColor, abortX, textY, const_cast<char*>(abortText), nullptr, xplmFont_Basic);
+        } else if (g_updatePopupMode == UpdatePopupMode::Error) {
+            XPLMDrawTranslucentDarkBox(
+                g_updateButtonOk.left, g_updateButtonOk.top, g_updateButtonOk.right, g_updateButtonOk.bottom);
+            const char* okText = "OK";
+            int okTextWidth = static_cast<int>(std::strlen(okText)) * charWidth;
+            int okX = g_updateButtonOk.left + (g_updateButtonOk.right - g_updateButtonOk.left - okTextWidth) / 2;
+            int textY = g_updateButtonOk.bottom + (kUpdateButtonHeight - charHeight) / 2;
+            float buttonColor[] = {0.9f, 0.9f, 0.9f};
+            XPLMDrawString(buttonColor, okX, textY, const_cast<char*>(okText), nullptr, xplmFont_Basic);
+        }
     }
 }
 
@@ -619,21 +679,66 @@ void ShowUpdateConfirm(const std::vector<std::string>& lines) {
     int bottom = 0;
     ComputeUpdateWindowGeometry(width, height, &left, &top, &right, &bottom);
     XPLMSetWindowGeometry(g_updateWindow, left, top, right, bottom);
-
-    int buttonBottom = bottom + kUpdatePopupPadding;
-    int buttonTop = buttonBottom + kUpdateButtonHeight;
-    int okRight = right - kUpdatePopupPadding;
-    int okLeft = okRight - kUpdateButtonWidth;
-    int abortRight = okLeft - kUpdateButtonGap;
-    int abortLeft = abortRight - kUpdateButtonWidth;
-    g_updateButtonOk = {okLeft, buttonTop, okRight, buttonBottom};
-    g_updateButtonAbort = {abortLeft, buttonTop, abortRight, buttonBottom};
-    g_updateButtonsValid = true;
+    UpdatePopupButtonRectsFromWindow(left, top, right, bottom);
 
     XPLMSetWindowIsVisible(g_updateWindow, 1);
     g_updatePopupVisible = true;
     g_updateDecisionPending = true;
     g_updateDecisionDeadline = XPLMGetElapsedTime() + kUpdateConfirmTimeoutSeconds;
+}
+
+void ShowUpdateError(const std::vector<std::string>& lines, const char* reloadReason) {
+    EnsureUpdateWindow();
+    if (!g_updateWindow) {
+        return;
+    }
+    g_updatePopupLines = lines;
+    if (g_updatePopupLines.empty()) {
+        return;
+    }
+    g_updatePopupMode = UpdatePopupMode::Error;
+    g_updateDecisionPending = false;
+    g_updateErrorPending = true;
+    g_updateButtonsValid = false;
+    g_updatePopupButtonArea = kUpdateButtonHeight + kUpdatePopupPadding * 2;
+    if (g_updatePopupLines.size() > kUpdatePopupMaxLines) {
+        size_t keep = kUpdatePopupMaxLines - 1;
+        size_t omitted = g_updatePopupLines.size() - keep;
+        g_updatePopupLines.resize(keep);
+        g_updatePopupLines.push_back("... " + std::to_string(omitted) + " more lines");
+    }
+
+    int charWidth = 0;
+    int charHeight = 0;
+    int digitsOnly = 0;
+    XPLMGetFontDimensions(xplmFont_Basic, &charWidth, &charHeight, &digitsOnly);
+    int lineHeight = charHeight + 2;
+    int maxLen = 0;
+    for (const auto& line : g_updatePopupLines) {
+        if (static_cast<int>(line.size()) > maxLen) {
+            maxLen = static_cast<int>(line.size());
+        }
+    }
+    int width = maxLen * charWidth + kUpdatePopupPadding * 2;
+    int minWidth = kUpdatePopupPadding * 2 + kUpdateButtonWidth;
+    if (width < minWidth) {
+        width = minWidth;
+    }
+    int height =
+        static_cast<int>(g_updatePopupLines.size()) * lineHeight + kUpdatePopupPadding * 2 + g_updatePopupButtonArea;
+
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+    ComputeUpdateWindowGeometry(width, height, &left, &top, &right, &bottom);
+    XPLMSetWindowGeometry(g_updateWindow, left, top, right, bottom);
+    UpdatePopupButtonRectsFromWindow(left, top, right, bottom);
+
+    XPLMSetWindowIsVisible(g_updateWindow, 1);
+    g_updatePopupVisible = true;
+    g_reloadAfterErrorAck = true;
+    g_updateErrorReloadReason = reloadReason ? reloadReason : "";
 }
 
 void HideUpdatePopup() {
@@ -648,6 +753,9 @@ void HideUpdatePopup() {
     g_updateButtonsValid = false;
     g_updatePopupButtonArea = 0;
     g_updateDecisionPending = false;
+    g_updateErrorPending = false;
+    g_reloadAfterErrorAck = false;
+    g_updateErrorReloadReason.clear();
 }
 
 void SaveUpdateWindowPosition() {
@@ -723,6 +831,16 @@ bool WriteUpdateWindowPos(int left, int top) {
 }
 
 void UpdatePopupVisibility(double now) {
+    if (g_updatePopupVisible && g_updateWindow && !XPLMGetWindowIsVisible(g_updateWindow)) {
+        if (g_updatePopupMode == UpdatePopupMode::Confirm && g_updateDecisionPending) {
+            HandleUpdateDecision(false, "closed");
+        } else if (g_updatePopupMode == UpdatePopupMode::Error && g_updateErrorPending) {
+            HandleUpdateErrorAck("closed");
+        } else {
+            HideUpdatePopup();
+        }
+        return;
+    }
     if (g_updatePopupVisible && g_updatePopupMode == UpdatePopupMode::Info && now >= g_updatePopupHideAt) {
         HideUpdatePopup();
     }
@@ -781,6 +899,25 @@ void HandleUpdateDecision(bool accept, const char* reason) {
         g_reloadRequested = false;
         TriggerReload("update skipped");
     }
+}
+
+void HandleUpdateErrorAck(const char* reason) {
+    if (!g_updateErrorPending) {
+        return;
+    }
+    g_updateErrorPending = false;
+    std::string reloadReason = g_updateErrorReloadReason;
+    if (reloadReason.empty() && reason && *reason) {
+        reloadReason = reason;
+    }
+    if (reloadReason.empty()) {
+        reloadReason = "update error";
+    }
+    g_updateErrorReloadReason.clear();
+    HideUpdatePopup();
+    g_reloadAfterErrorAck = false;
+    g_reloadRequested = false;
+    TriggerReload(reloadReason.c_str());
 }
 
 void SetStatus(const std::string& status) {
@@ -1120,6 +1257,301 @@ std::string BuildUpdatePathError(const char* label, const std::filesystem::path&
     return oss.str();
 }
 
+#ifdef _WIN32
+bool WinGetPathAttributes(const std::filesystem::path& path, DWORD* attrsOut) {
+    if (!attrsOut) {
+        return false;
+    }
+    DWORD attrs = GetFileAttributesW(path.wstring().c_str());
+    if (attrs == INVALID_FILE_ATTRIBUTES) {
+        return false;
+    }
+    *attrsOut = attrs;
+    return true;
+}
+#endif
+
+std::string NormalizeUpdateSourcePath(const std::string& path) {
+#ifdef _WIN32
+    std::string out = path;
+    for (char& c : out) {
+        if (c == '/') {
+            c = '\\';
+        }
+    }
+    if (out.rfind("\\\\?\\", 0) == 0) {
+        return out;
+    }
+    if (out.rfind("\\\\", 0) == 0) {
+        return std::string("\\\\?\\UNC\\") + out.substr(2);
+    }
+    return out;
+#else
+    return path;
+#endif
+}
+
+std::string BuildUpdatePathErrorWithRaw(const char* label,
+    const std::filesystem::path& path,
+    const std::string& raw,
+    const std::error_code& ec) {
+    std::string msg = BuildUpdatePathError(label, path, ec);
+    std::string normalized = path.string();
+    if (!raw.empty() && raw != normalized) {
+        msg += " (raw: " + raw + ")";
+    }
+    return msg;
+}
+
+bool GetPathInfo(const std::filesystem::path& path, bool* isDirOut, std::error_code* ec) {
+    std::error_code localEc;
+    bool exists = std::filesystem::exists(path, localEc);
+    if (exists && !localEc) {
+        if (isDirOut) {
+            std::error_code dirEc;
+            bool isDir = std::filesystem::is_directory(path, dirEc);
+            if (dirEc) {
+                if (ec) {
+                    *ec = dirEc;
+                }
+                return false;
+            }
+            *isDirOut = isDir;
+        }
+        if (ec) {
+            ec->clear();
+        }
+        return true;
+    }
+#ifdef _WIN32
+    DWORD attrs = GetFileAttributesW(path.wstring().c_str());
+    if (attrs != INVALID_FILE_ATTRIBUTES) {
+        if (isDirOut) {
+            *isDirOut = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+        }
+        if (ec) {
+            ec->clear();
+        }
+        return true;
+    }
+    DWORD winerr = GetLastError();
+    if (ec && winerr != 0) {
+        *ec = std::error_code(static_cast<int>(winerr), std::system_category());
+    }
+#endif
+    if (ec) {
+        *ec = localEc;
+    }
+    return false;
+}
+
+#ifdef _WIN32
+struct WinUpdateEntry {
+    std::filesystem::path abs;
+    std::filesystem::path rel;
+    std::string relStr;
+    bool isDir = false;
+    uint64_t size = 0;
+    FILETIME writeTime = {};
+};
+
+struct WinFileInfo {
+    bool exists = false;
+    bool isDir = false;
+    uint64_t size = 0;
+    DWORD attrs = 0;
+    FILETIME writeTime = {};
+};
+
+bool WinGetFileInfo(const std::filesystem::path& path, WinFileInfo* info, std::string* error) {
+    if (!info) {
+        return false;
+    }
+    WIN32_FILE_ATTRIBUTE_DATA data{};
+    if (!GetFileAttributesExW(path.wstring().c_str(), GetFileExInfoStandard, &data)) {
+        DWORD winerr = GetLastError();
+        if (winerr == ERROR_FILE_NOT_FOUND || winerr == ERROR_PATH_NOT_FOUND) {
+            *info = WinFileInfo{};
+            return true;
+        }
+        if (error) {
+            std::string msg = GetWin32ErrorMessage(winerr);
+            std::ostringstream oss;
+            oss << "GetFileAttributesExW failed for " << path.string() << " (win=" << winerr;
+            if (!msg.empty()) {
+                oss << ": " << msg;
+            }
+            oss << ")";
+            *error = oss.str();
+        }
+        return false;
+    }
+    info->exists = true;
+    info->attrs = data.dwFileAttributes;
+    info->isDir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+    ULARGE_INTEGER size;
+    size.LowPart = data.nFileSizeLow;
+    size.HighPart = data.nFileSizeHigh;
+    info->size = size.QuadPart;
+    info->writeTime = data.ftLastWriteTime;
+    return true;
+}
+
+bool WinSetLastWriteTime(const std::filesystem::path& path, const FILETIME& ft, bool isDir, std::string* error) {
+    DWORD flags = isDir ? FILE_FLAG_BACKUP_SEMANTICS : FILE_ATTRIBUTE_NORMAL;
+    HANDLE handle = CreateFileW(
+        path.wstring().c_str(),
+        FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        flags,
+        nullptr);
+    if (handle == INVALID_HANDLE_VALUE) {
+        DWORD winerr = GetLastError();
+        if (error) {
+            std::string msg = GetWin32ErrorMessage(winerr);
+            std::ostringstream oss;
+            oss << "CreateFileW failed for " << path.string() << " (win=" << winerr;
+            if (!msg.empty()) {
+                oss << ": " << msg;
+            }
+            oss << ")";
+            *error = oss.str();
+        }
+        return false;
+    }
+    BOOL ok = SetFileTime(handle, nullptr, nullptr, &ft);
+    DWORD winerr = ok ? 0 : GetLastError();
+    CloseHandle(handle);
+    if (!ok) {
+        if (error) {
+            std::string msg = GetWin32ErrorMessage(winerr);
+            std::ostringstream oss;
+            oss << "SetFileTime failed for " << path.string() << " (win=" << winerr;
+            if (!msg.empty()) {
+                oss << ": " << msg;
+            }
+            oss << ")";
+            *error = oss.str();
+        }
+        return false;
+    }
+    return true;
+}
+
+bool WinEnumerateUpdateSource(const std::filesystem::path& src,
+    const std::vector<std::string>& excludes,
+    std::vector<WinUpdateEntry>* out,
+    std::string* error) {
+    if (!out) {
+        return false;
+    }
+    out->clear();
+    struct StackItem {
+        std::filesystem::path abs;
+        std::filesystem::path rel;
+    };
+    std::vector<StackItem> stack;
+    stack.push_back({src, std::filesystem::path()});
+    std::string firstError;
+    int skipped = 0;
+    while (!stack.empty()) {
+        StackItem item = stack.back();
+        stack.pop_back();
+        std::wstring pattern = item.abs.wstring();
+        if (!pattern.empty() && pattern.back() != L'\\' && pattern.back() != L'/') {
+            pattern.push_back(L'\\');
+        }
+        pattern.push_back(L'*');
+        WIN32_FIND_DATAW data{};
+        HANDLE handle = FindFirstFileW(pattern.c_str(), &data);
+        if (handle == INVALID_HANDLE_VALUE) {
+            DWORD winerr = GetLastError();
+            if (winerr == ERROR_FILE_NOT_FOUND) {
+                continue;
+            }
+            if (firstError.empty()) {
+                std::string msg = GetWin32ErrorMessage(winerr);
+                std::ostringstream oss;
+                oss << "FindFirstFileW failed for " << item.abs.string() << " (win=" << winerr;
+                if (!msg.empty()) {
+                    oss << ": " << msg;
+                }
+                oss << ")";
+                firstError = oss.str();
+            }
+            ++skipped;
+            if (item.rel.empty()) {
+                if (error && !firstError.empty()) {
+                    *error = firstError;
+                }
+                return false;
+            }
+            continue;
+        }
+        do {
+            if (wcscmp(data.cFileName, L".") == 0 || wcscmp(data.cFileName, L"..") == 0) {
+                continue;
+            }
+            std::filesystem::path name(data.cFileName);
+            std::filesystem::path childRel = item.rel / name;
+            std::string relStr = childRel.generic_string();
+            if (IsExcludedRelPath(relStr, excludes)) {
+                continue;
+            }
+            bool isDir = (data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            bool isReparse = (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+            if (isReparse) {
+                continue;
+            }
+            WinUpdateEntry entry;
+            entry.abs = item.abs / name;
+            entry.rel = childRel;
+            entry.relStr = relStr;
+            entry.isDir = isDir;
+            entry.writeTime = data.ftLastWriteTime;
+            ULARGE_INTEGER size;
+            size.LowPart = data.nFileSizeLow;
+            size.HighPart = data.nFileSizeHigh;
+            entry.size = size.QuadPart;
+            out->push_back(entry);
+            if (isDir) {
+                stack.push_back({entry.abs, childRel});
+            }
+        } while (FindNextFileW(handle, &data));
+        FindClose(handle);
+    }
+    if (error && skipped > 0 && !firstError.empty()) {
+        std::ostringstream oss;
+        oss << "WinAPI enumeration skipped " << skipped << " directories. First error: " << firstError;
+        *error = oss.str();
+    }
+    return true;
+}
+
+bool ShouldCopyFileWin(const WinUpdateEntry& entry, const std::filesystem::path& dst, std::string* error) {
+    WinFileInfo dstInfo;
+    std::string infoError;
+    if (!WinGetFileInfo(dst, &dstInfo, &infoError)) {
+        if (error && !infoError.empty()) {
+            *error = infoError;
+        }
+        return true;
+    }
+    if (!dstInfo.exists || dstInfo.isDir) {
+        return true;
+    }
+    if (dstInfo.size != entry.size) {
+        return true;
+    }
+    if (CompareFileTime(&entry.writeTime, &dstInfo.writeTime) > 0) {
+        return true;
+    }
+    return false;
+}
+#endif
+
 std::string NormalizeUpdateExcludeToken(std::string token) {
     token = Trim(token);
     if (token.empty()) {
@@ -1214,6 +1646,9 @@ void NormalizeUpdateConfig(UpdateConfig* cfg) {
     }
     if (!hasExclude("agents.md")) {
         cfg->excludes.push_back("agents.md");
+    }
+    if (!hasExclude(".vscode")) {
+        cfg->excludes.push_back(".vscode");
     }
 }
 
@@ -1530,8 +1965,13 @@ bool PerformUpdateJob(const HttpJob& job,
     std::vector<std::string>* logLines,
     size_t* logOmitted,
     UpdateCounters* counters) {
-    std::filesystem::path src(job.update_source);
-    std::filesystem::path dst(job.update_target);
+    std::string srcRaw = job.update_source;
+    std::string dstRaw = job.update_target;
+    std::string srcNorm = NormalizeUpdateSourcePath(srcRaw);
+    std::string dstNorm = NormalizeUpdateSourcePath(dstRaw);
+    std::filesystem::path src(srcRaw);
+    std::filesystem::path dst(dstRaw);
+    bool srcUsedNormalized = false;
     if (logOmitted) {
         *logOmitted = 0;
     }
@@ -1562,30 +2002,57 @@ bool PerformUpdateJob(const HttpJob& job,
         return false;
     }
     std::error_code ec;
-    if (!std::filesystem::exists(src, ec) || ec) {
+    bool srcIsDir = false;
+    bool srcExists = GetPathInfo(src, &srcIsDir, &ec);
+    if ((!srcExists || ec) && srcNorm != srcRaw) {
+        std::filesystem::path alt(srcNorm);
+        std::error_code altEc;
+        bool altIsDir = false;
+        bool altExists = GetPathInfo(alt, &altIsDir, &altEc);
+        if (altExists && !altEc) {
+            src = alt;
+            srcIsDir = altIsDir;
+            srcExists = true;
+            ec.clear();
+            srcUsedNormalized = true;
+        }
+    }
+    if (!srcExists || ec) {
         if (error) {
-            *error = BuildUpdatePathError("Update source not found", src, ec);
+            *error = BuildUpdatePathErrorWithRaw("Update source not found", src, srcRaw, ec);
+        }
+        return false;
+    }
+    if (!srcIsDir) {
+        if (error) {
+            *error = BuildUpdatePathErrorWithRaw("Update source is not a directory", src, srcRaw, ec);
         }
         return false;
     }
     ec.clear();
-    if (!std::filesystem::is_directory(src, ec) || ec) {
+    bool dstIsDir = false;
+    bool dstExists = GetPathInfo(dst, &dstIsDir, &ec);
+    if ((!dstExists || ec) && dstNorm != dstRaw) {
+        std::filesystem::path alt(dstNorm);
+        std::error_code altEc;
+        bool altIsDir = false;
+        bool altExists = GetPathInfo(alt, &altIsDir, &altEc);
+        if (altExists && !altEc) {
+            dst = alt;
+            dstIsDir = altIsDir;
+            dstExists = true;
+            ec.clear();
+        }
+    }
+    if (!dstExists || ec) {
         if (error) {
-            *error = BuildUpdatePathError("Update source is not a directory", src, ec);
+            *error = BuildUpdatePathErrorWithRaw("YAL plugin path not found", dst, dstRaw, ec);
         }
         return false;
     }
-    ec.clear();
-    if (!std::filesystem::exists(dst, ec) || ec) {
+    if (!dstIsDir) {
         if (error) {
-            *error = BuildUpdatePathError("YAL plugin path not found", dst, ec);
-        }
-        return false;
-    }
-    ec.clear();
-    if (!std::filesystem::is_directory(dst, ec) || ec) {
-        if (error) {
-            *error = BuildUpdatePathError("YAL plugin path is not a directory", dst, ec);
+            *error = BuildUpdatePathErrorWithRaw("YAL plugin path is not a directory", dst, dstRaw, ec);
         }
         return false;
     }
@@ -1603,16 +2070,37 @@ bool PerformUpdateJob(const HttpJob& job,
     size_t failed = 0;
     size_t deleted = 0;
     size_t deleteFailed = 0;
+    size_t dirTs = 0;
+    size_t sourceEntries = 0;
+    std::string firstFailure;
+    bool loggedFailure = false;
+    auto formatEc = [](const std::error_code& err) {
+        if (!err) {
+            return std::string();
+        }
+        return std::to_string(err.value()) + ": " + err.message();
+    };
+    auto recordFailure = [&](const std::string& msg) {
+        if (firstFailure.empty()) {
+            firstFailure = msg;
+        }
+        if (!loggedFailure) {
+            Log(LOG_ERR, "Update error: " + msg);
+            loggedFailure = true;
+        }
+    };
     const char* copyPrefix = dryRun ? "copy " : "copied ";
     const char* deletePrefix = dryRun ? "delete " : "deleted ";
     std::vector<std::pair<std::filesystem::path, std::filesystem::file_time_type>> sourceDirTimes;
+#ifdef _WIN32
+    bool usedWinFallback = false;
+    std::vector<std::pair<std::filesystem::path, FILETIME>> sourceDirTimesWin;
+#endif
     const auto options = std::filesystem::directory_options::skip_permission_denied;
-    if (!dryRun) {
-        std::error_code rootTimeEc;
-        auto rootTime = std::filesystem::last_write_time(src, rootTimeEc);
-        if (!rootTimeEc) {
-            sourceDirTimes.emplace_back(std::filesystem::path("."), rootTime);
-        }
+    std::error_code rootTimeEc;
+    auto rootTime = std::filesystem::last_write_time(src, rootTimeEc);
+    if (!rootTimeEc) {
+        sourceDirTimes.emplace_back(std::filesystem::path("."), rootTime);
     }
     std::filesystem::recursive_directory_iterator it(src, options, ec);
     std::filesystem::recursive_directory_iterator end;
@@ -1631,18 +2119,22 @@ bool PerformUpdateJob(const HttpJob& job,
             it.increment(ec);
             continue;
         }
+        ++sourceEntries;
         std::filesystem::path dstPath = dst / relPath;
         if (it->is_directory()) {
+            std::error_code dirTimeEc;
+            auto dirTime = std::filesystem::last_write_time(it->path(), dirTimeEc);
+            if (!dirTimeEc) {
+                sourceDirTimes.emplace_back(relPath, dirTime);
+            }
             if (!dryRun) {
-                std::error_code dirTimeEc;
-                auto dirTime = std::filesystem::last_write_time(it->path(), dirTimeEc);
-                if (!dirTimeEc) {
-                    sourceDirTimes.emplace_back(relPath, dirTime);
-                }
                 std::filesystem::create_directories(dstPath, ec);
                 if (!ec) {
                     ++dirsCreated;
                 } else {
+                    if (!dryRun) {
+                        recordFailure("mkdir " + rel + " (ec=" + formatEc(ec) + ")");
+                    }
                     ec.clear();
                     ++failed;
                 }
@@ -1656,6 +2148,7 @@ bool PerformUpdateJob(const HttpJob& job,
         }
         if (!ShouldCopyFile(it->path(), dstPath, &ec)) {
             if (ec) {
+                recordFailure("stat " + rel + " (ec=" + formatEc(ec) + ")");
                 ec.clear();
                 ++failed;
             } else {
@@ -1674,8 +2167,36 @@ bool PerformUpdateJob(const HttpJob& job,
         if (ec) {
             ec.clear();
         }
+        bool copyOk = false;
+        ec.clear();
         std::filesystem::copy_file(it->path(), dstPath, std::filesystem::copy_options::overwrite_existing, ec);
-        if (ec) {
+        if (!ec) {
+            copyOk = true;
+        }
+#ifdef _WIN32
+        DWORD winerr = 0;
+        if (!copyOk) {
+            if (CopyFileW(it->path().wstring().c_str(), dstPath.wstring().c_str(), FALSE)) {
+                copyOk = true;
+                ec.clear();
+            } else {
+                winerr = GetLastError();
+            }
+        }
+#endif
+        if (!copyOk) {
+            std::string msg = "copy " + rel + " (ec=" + formatEc(ec) + ")";
+#ifdef _WIN32
+            if (winerr != 0) {
+                std::string winmsg = GetWin32ErrorMessage(winerr);
+                msg += " (win=" + std::to_string(winerr);
+                if (!winmsg.empty()) {
+                    msg += ": " + winmsg;
+                }
+                msg += ")";
+            }
+#endif
+            recordFailure(msg);
             ec.clear();
             ++failed;
         } else {
@@ -1687,10 +2208,196 @@ bool PerformUpdateJob(const HttpJob& job,
                 std::filesystem::last_write_time(dstPath, srcTime, timeEc);
             }
             if (timeEc) {
+                recordFailure("timestamp " + rel + " (ec=" + formatEc(timeEc) + ")");
                 ++failed;
             }
         }
         it.increment(ec);
+    }
+
+#ifdef _WIN32
+    if (sourceEntries == 0) {
+        std::vector<WinUpdateEntry> winEntries;
+        std::string winEnumError;
+        if (WinEnumerateUpdateSource(src, job.update_excludes, &winEntries, &winEnumError) && !winEntries.empty()) {
+            usedWinFallback = true;
+            std::string firstCopyError;
+            std::string firstTimeError;
+            int copyErrors = 0;
+            int timeErrors = 0;
+            if (!winEnumError.empty()) {
+                Log(LOG_INFO, "Update scan WinAPI enumeration warning: " + winEnumError);
+            }
+            Log(LOG_INFO, "Update scan WinAPI enumeration used for source: " + src.string());
+            WinFileInfo rootInfo;
+            if (WinGetFileInfo(src, &rootInfo, nullptr) && rootInfo.exists) {
+                sourceDirTimesWin.emplace_back(std::filesystem::path("."), rootInfo.writeTime);
+            }
+            for (const auto& entry : winEntries) {
+                ++sourceEntries;
+                std::filesystem::path dstPath = dst / entry.rel;
+                if (entry.isDir) {
+                    sourceDirTimesWin.emplace_back(entry.rel, entry.writeTime);
+                    if (!dryRun) {
+                        std::filesystem::create_directories(dstPath, ec);
+                        if (!ec) {
+                            ++dirsCreated;
+                        } else {
+                            ec.clear();
+                            ++failed;
+                        }
+                    }
+                    continue;
+                }
+                if (!ShouldCopyFileWin(entry, dstPath, nullptr)) {
+                    ++skipped;
+                    continue;
+                }
+                if (dryRun) {
+                    ++copied;
+                    noteChange(copyPrefix, entry.relStr);
+                    continue;
+                }
+                std::filesystem::create_directories(dstPath.parent_path(), ec);
+                if (ec) {
+                    ec.clear();
+                }
+                if (!CopyFileW(entry.abs.wstring().c_str(), dstPath.wstring().c_str(), FALSE)) {
+                    ++failed;
+                    ++copyErrors;
+            if (copyErrors == 1) {
+                DWORD winerr = GetLastError();
+                std::string msg = GetWin32ErrorMessage(winerr);
+                std::ostringstream oss;
+                        oss << entry.relStr << " (win=" << winerr;
+                        if (!msg.empty()) {
+                            oss << ": " << msg;
+                }
+                oss << ")";
+                firstCopyError = oss.str();
+                recordFailure("copy " + entry.relStr + " (win=" + std::to_string(winerr)
+                    + (msg.empty() ? "" : ": " + msg) + ")");
+            }
+            continue;
+        }
+                ++copied;
+                noteChange(copyPrefix, entry.relStr);
+                std::string winTimeError;
+                if (!WinSetLastWriteTime(dstPath, entry.writeTime, false, &winTimeError)) {
+                    ++failed;
+                    ++timeErrors;
+                    if (timeErrors == 1) {
+                        firstTimeError = entry.relStr;
+                        if (!winTimeError.empty()) {
+                            recordFailure("timestamp " + entry.relStr + " (" + winTimeError + ")");
+                        } else {
+                            recordFailure("timestamp " + entry.relStr + " (win error)");
+                        }
+                    }
+                }
+            }
+            if (!dryRun && copyErrors > 0 && !firstCopyError.empty()) {
+                Log(LOG_ERR, "Update copy failed (WinAPI). First error: " + firstCopyError);
+            }
+            if (!dryRun && timeErrors > 0 && !firstTimeError.empty()) {
+                Log(LOG_ERR, "Update timestamp failed (WinAPI). First file: " + firstTimeError);
+            }
+        } else if (!winEnumError.empty()) {
+            Log(LOG_INFO, "Update scan WinAPI enumeration failed: " + winEnumError);
+        }
+    }
+#endif
+
+    if (sourceEntries == 0) {
+        if (error) {
+            std::string msg = "Update source contains no files after excludes";
+            if (srcUsedNormalized) {
+                msg += " (normalized path used)";
+            }
+#ifdef _WIN32
+            if (usedWinFallback) {
+                msg += " (WinAPI fallback used)";
+            }
+#endif
+            *error = msg + "; check update_source/update_exclude";
+        }
+        return false;
+    }
+
+    auto noteDirTimeChange = [&](const std::filesystem::path& relPath) {
+        std::string relStr;
+        if (relPath.empty() || relPath == ".") {
+            relStr = ".";
+        } else {
+            relStr = relPath.generic_string();
+        }
+        ++dirTs;
+        noteChange("dir_ts ", relStr);
+    };
+
+    if (dryRun) {
+#ifdef _WIN32
+        if (usedWinFallback) {
+            for (const auto& entry : sourceDirTimesWin) {
+                const std::filesystem::path& relPath = entry.first;
+                std::filesystem::path dstPath;
+                if (relPath.empty() || relPath == ".") {
+                    dstPath = dst;
+                } else {
+                    dstPath = dst / relPath;
+                }
+                WinFileInfo dstInfo;
+                if (!WinGetFileInfo(dstPath, &dstInfo, nullptr)) {
+                    noteDirTimeChange(relPath);
+                    continue;
+                }
+                if (!dstInfo.exists || !dstInfo.isDir) {
+                    noteDirTimeChange(relPath);
+                    continue;
+                }
+                if (CompareFileTime(&entry.second, &dstInfo.writeTime) != 0) {
+                    noteDirTimeChange(relPath);
+                }
+            }
+        } else
+#endif
+        {
+            for (const auto& entry : sourceDirTimes) {
+                const std::filesystem::path& relPath = entry.first;
+                const auto& dirTime = entry.second;
+                std::filesystem::path dstPath;
+                if (relPath.empty() || relPath == ".") {
+                    dstPath = dst;
+                } else {
+                    dstPath = dst / relPath;
+                }
+                std::error_code timeEc;
+                if (!std::filesystem::exists(dstPath, timeEc) || timeEc) {
+                    if (timeEc) {
+                        timeEc.clear();
+                    }
+                    noteDirTimeChange(relPath);
+                    continue;
+                }
+                timeEc.clear();
+                if (!std::filesystem::is_directory(dstPath, timeEc) || timeEc) {
+                    if (timeEc) {
+                        timeEc.clear();
+                    }
+                    noteDirTimeChange(relPath);
+                    continue;
+                }
+                auto dstTime = std::filesystem::last_write_time(dstPath, timeEc);
+                if (timeEc) {
+                    timeEc.clear();
+                    noteDirTimeChange(relPath);
+                    continue;
+                }
+                if (dirTime != dstTime) {
+                    noteDirTimeChange(relPath);
+                }
+            }
+        }
     }
 
     ec.clear();
@@ -1720,8 +2427,9 @@ bool PerformUpdateJob(const HttpJob& job,
         }
         std::filesystem::path srcPath = src / relPath;
         std::error_code existsEc;
-        bool exists = std::filesystem::exists(srcPath, existsEc);
+        bool exists = GetPathInfo(srcPath, nullptr, &existsEc);
         if (existsEc) {
+            recordFailure("exists " + rel + " (ec=" + formatEc(existsEc) + ")");
             ++deleteFailed;
             ++failed;
             existsEc.clear();
@@ -1735,6 +2443,7 @@ bool PerformUpdateJob(const HttpJob& job,
             } else {
                 std::filesystem::remove(dit->path(), ec);
                 if (ec) {
+                    recordFailure("delete " + rel + " (ec=" + formatEc(ec) + ")");
                     ++deleteFailed;
                     ++failed;
                     ec.clear();
@@ -1783,7 +2492,7 @@ bool PerformUpdateJob(const HttpJob& job,
             }
             std::filesystem::path srcPath = src / relPath;
             std::error_code existsEc;
-            bool exists = std::filesystem::exists(srcPath, existsEc);
+            bool exists = GetPathInfo(srcPath, nullptr, &existsEc);
             if (existsEc) {
                 ++deleteFailed;
                 ++failed;
@@ -1796,6 +2505,7 @@ bool PerformUpdateJob(const HttpJob& job,
             std::error_code emptyEc;
             if (!std::filesystem::is_empty(dirPath, emptyEc) || emptyEc) {
                 if (emptyEc) {
+                    recordFailure("is_empty " + rel + " (ec=" + formatEc(emptyEc) + ")");
                     ++deleteFailed;
                     ++failed;
                     emptyEc.clear();
@@ -1804,41 +2514,108 @@ bool PerformUpdateJob(const HttpJob& job,
             }
             std::filesystem::remove(dirPath, ec);
             if (ec) {
+                recordFailure("delete_dir " + rel + " (ec=" + formatEc(ec) + ")");
                 ++deleteFailed;
                 ++failed;
                 ec.clear();
             }
         }
 
-        for (const auto& entry : sourceDirTimes) {
-            const std::filesystem::path& relPath = entry.first;
-            const auto& dirTime = entry.second;
-            std::filesystem::path dstPath;
-            if (relPath.empty() || relPath == ".") {
-                dstPath = dst;
-            } else {
-                dstPath = dst / relPath;
-            }
-            std::error_code timeEc;
-            if (!std::filesystem::exists(dstPath, timeEc) || timeEc) {
-                if (timeEc) {
-                    ++failed;
-                    timeEc.clear();
+        std::sort(sourceDirTimes.begin(), sourceDirTimes.end(),
+            [](const auto& a, const auto& b) {
+                return a.first.native().size() > b.first.native().size();
+            });
+#ifdef _WIN32
+        std::sort(sourceDirTimesWin.begin(), sourceDirTimesWin.end(),
+            [](const auto& a, const auto& b) {
+                return a.first.native().size() > b.first.native().size();
+            });
+#endif
+
+#ifdef _WIN32
+        if (usedWinFallback) {
+            for (const auto& entry : sourceDirTimesWin) {
+                const std::filesystem::path& relPath = entry.first;
+                std::filesystem::path dstPath;
+                if (relPath.empty() || relPath == ".") {
+                    dstPath = dst;
+                } else {
+                    dstPath = dst / relPath;
                 }
-                continue;
-            }
-            timeEc.clear();
-            if (!std::filesystem::is_directory(dstPath, timeEc) || timeEc) {
-                if (timeEc) {
+                WinFileInfo dstInfo;
+                if (!WinGetFileInfo(dstPath, &dstInfo, nullptr)) {
                     ++failed;
-                    timeEc.clear();
+                    continue;
                 }
-                continue;
+                if (!dstInfo.exists || !dstInfo.isDir) {
+                    continue;
+                }
+                std::string winTimeError;
+                if (!WinSetLastWriteTime(dstPath, entry.second, true, &winTimeError)) {
+                    ++failed;
+                    if (!winTimeError.empty()) {
+                        recordFailure("timestamp_dir " + relPath.generic_string() + " (" + winTimeError + ")");
+                    } else {
+                        recordFailure("timestamp_dir " + relPath.generic_string() + " (win error)");
+                    }
+                } else {
+                    ++dirTs;
+                }
             }
-            std::filesystem::last_write_time(dstPath, dirTime, timeEc);
-            if (timeEc) {
-                ++failed;
+        } else
+#endif
+        {
+            for (const auto& entry : sourceDirTimes) {
+                const std::filesystem::path& relPath = entry.first;
+                const auto& dirTime = entry.second;
+                std::filesystem::path dstPath;
+                if (relPath.empty() || relPath == ".") {
+                    dstPath = dst;
+                } else {
+                    dstPath = dst / relPath;
+                }
+                std::error_code timeEc;
+                if (!std::filesystem::exists(dstPath, timeEc) || timeEc) {
+                    if (timeEc) {
+                        ++failed;
+                        timeEc.clear();
+                    }
+                    continue;
+                }
                 timeEc.clear();
+                if (!std::filesystem::is_directory(dstPath, timeEc) || timeEc) {
+                    if (timeEc) {
+                        ++failed;
+                        timeEc.clear();
+                    }
+                    continue;
+                }
+                std::filesystem::last_write_time(dstPath, dirTime, timeEc);
+                if (timeEc) {
+#ifdef _WIN32
+                    std::filesystem::path srcPath;
+                    if (relPath.empty() || relPath == ".") {
+                        srcPath = src;
+                    } else {
+                        srcPath = src / relPath;
+                    }
+                    WinFileInfo srcInfo;
+                    std::string winTimeError;
+                    if (WinGetFileInfo(srcPath, &srcInfo, nullptr) && srcInfo.exists && srcInfo.isDir) {
+                        if (WinSetLastWriteTime(dstPath, srcInfo.writeTime, true, &winTimeError)) {
+                            ++dirTs;
+                            timeEc.clear();
+                            continue;
+                        }
+                    }
+#endif
+                    recordFailure("timestamp_dir " + relPath.generic_string()
+                        + " (ec=" + formatEc(timeEc) + ")");
+                    ++failed;
+                    timeEc.clear();
+                } else {
+                    ++dirTs;
+                }
             }
         }
     }
@@ -1849,7 +2626,8 @@ bool PerformUpdateJob(const HttpJob& job,
             ss << "scan ";
         }
         ss << "copied=" << copied << " skipped=" << skipped << " dirs=" << dirsCreated
-           << " deleted=" << deleted << " del_failed=" << deleteFailed << " failed=" << failed;
+           << " deleted=" << deleted << " del_failed=" << deleteFailed << " failed=" << failed
+           << " dir_ts=" << dirTs;
         *summary = ss.str();
     }
     if (counters) {
@@ -1859,10 +2637,11 @@ bool PerformUpdateJob(const HttpJob& job,
         counters->deleted = deleted;
         counters->deleteFailed = deleteFailed;
         counters->failed = failed;
+        counters->dir_ts = dirTs;
     }
     if (failed > 0) {
         if (error) {
-            *error = "Update completed with errors";
+            *error = firstFailure.empty() ? "Update completed with errors" : firstFailure;
         }
         return false;
     }
@@ -1988,6 +2767,9 @@ void ResetOperationalState(double now) {
     g_reloadAfterUpdateAt = 0.0;
     g_updateScanPending = false;
     g_updateDecisionPending = false;
+    g_updateErrorPending = false;
+    g_reloadAfterErrorAck = false;
+    g_updateErrorReloadReason.clear();
     g_reloadRequested = false;
     g_updatePlanValid = false;
     g_updateShowResultPopup = false;
@@ -2862,7 +3644,14 @@ void DrainResults(bool allowDelivery) {
                 g_updatePlanValid = false;
                 if (g_reloadRequested) {
                     g_reloadRequested = false;
-                    TriggerReload("update scan failed");
+                    if (g_updateConfig.enabled && !g_updateConfig.source.empty()) {
+                        std::vector<std::string> popupLines;
+                        popupLines.push_back("YAL update failed");
+                        popupLines.push_back(res.error);
+                        ShowUpdateError(popupLines, "update scan failed");
+                    } else {
+                        TriggerReload("update scan failed");
+                    }
                 }
                 continue;
             }
@@ -2880,8 +3669,8 @@ void DrainResults(bool allowDelivery) {
                 LogAlways("Update scan " + omitted);
             }
 
-            const size_t totalChanges =
-                res.update_counts.copied + res.update_counts.deleted + res.update_log_omitted;
+            const size_t totalChanges = res.update_counts.copied + res.update_counts.deleted
+                + res.update_counts.dir_ts + res.update_log_omitted;
             if (totalChanges == 0) {
                 LogAlways("Update scan: no changes.");
                 g_updatePlanValid = false;
@@ -2895,6 +3684,9 @@ void DrainResults(bool allowDelivery) {
             std::ostringstream header;
             header << "YAL update pending: " << res.update_counts.copied << " copy, "
                    << res.update_counts.deleted << " delete";
+            if (res.update_counts.dir_ts > 0) {
+                header << ", " << res.update_counts.dir_ts << " dir-ts";
+            }
             if (res.update_log_omitted > 0) {
                 header << " (+" << res.update_log_omitted << " more)";
             }
@@ -2921,7 +3713,15 @@ void DrainResults(bool allowDelivery) {
                 LogAlways("Update ok: " + summary);
             } else {
                 LogAlways("Update failed: " + res.error);
-                if (showResultPopup) {
+                if (g_reloadAfterUpdate && g_updateConfig.enabled && !g_updateConfig.source.empty()) {
+                    std::vector<std::string> errorLines;
+                    errorLines.push_back("YAL update failed");
+                    errorLines.push_back(res.error);
+                    ShowUpdateError(errorLines, "update failed");
+                    g_reloadAfterUpdate = false;
+                    g_reloadAfterUpdateAt = 0.0;
+                    showResultPopup = false;
+                } else if (showResultPopup) {
                     popupLines.push_back("YAL update failed: " + res.error);
                 }
             }
@@ -3051,9 +3851,13 @@ bool HandleReloadRequest() {
     }
     XPLMSetDatai(g_dref.reload_request, 0);
     if (g_updateConfig.enabled && !g_updateConfig.source.empty()) {
-        if (g_updateScanPending || g_updateDecisionPending || g_updatePending) {
+        if (g_updateScanPending || g_updateDecisionPending || g_updatePending || g_updateErrorPending) {
             g_reloadRequested = true;
-            Log(LOG_INFO, "Reload requested while update pending; will reload after update.");
+            if (g_updateErrorPending) {
+                Log(LOG_INFO, "Reload requested while update error pending; will reload after acknowledgement.");
+            } else {
+                Log(LOG_INFO, "Reload requested while update pending; will reload after update.");
+            }
             return true;
         }
         std::filesystem::path target = GetYalPluginPath();
@@ -3444,6 +4248,9 @@ PLUGIN_API void XPluginDisable() {
     g_updatePopupButtonArea = 0;
     g_updateDecisionPending = false;
     g_updateDecisionDeadline = 0.0;
+    g_updateErrorPending = false;
+    g_reloadAfterErrorAck = false;
+    g_updateErrorReloadReason.clear();
     g_updateScanPending = false;
     g_reloadRequested = false;
     g_updateShowResultPopup = false;
