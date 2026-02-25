@@ -31,6 +31,7 @@
 #include <random>
 #include <regex>
 #include <sstream>
+#include <unordered_set>
 #include <system_error>
 #include <string>
 #include <thread>
@@ -2239,6 +2240,30 @@ bool PerformUpdateJob(const HttpJob& job,
             ++(*logOmitted);
         }
     };
+    std::unordered_set<std::string> changedDirs;
+    auto normalizeRelDirKey = [](const std::filesystem::path& relPath) -> std::string {
+        if (relPath.empty() || relPath == ".") {
+            return ".";
+        }
+        return relPath.generic_string();
+    };
+    auto markChangedFileRel = [&](const std::filesystem::path& relFile) {
+        std::filesystem::path current = relFile.parent_path();
+        while (true) {
+            changedDirs.insert(normalizeRelDirKey(current));
+            if (current.empty() || current == ".") {
+                break;
+            }
+            current = current.parent_path();
+        }
+    };
+    auto shouldUpdateDirTs = [&](const std::filesystem::path& relPath) -> bool {
+        if (changedDirs.empty()) {
+            return false;
+        }
+        std::string key = normalizeRelDirKey(relPath);
+        return changedDirs.find(key) != changedDirs.end();
+    };
     if (src.empty()) {
         if (error) {
             *error = "Update source is empty";
@@ -2410,6 +2435,7 @@ bool PerformUpdateJob(const HttpJob& job,
         if (dryRun) {
             ++copied;
             noteChange(copyPrefix, rel);
+            markChangedFileRel(relPath);
             it.increment(ec);
             continue;
         }
@@ -2452,6 +2478,7 @@ bool PerformUpdateJob(const HttpJob& job,
         } else {
             ++copied;
             noteChange(copyPrefix, rel);
+            markChangedFileRel(relPath);
             std::error_code timeEc;
             auto srcTime = std::filesystem::last_write_time(it->path(), timeEc);
             if (!timeEc) {
@@ -2506,6 +2533,7 @@ bool PerformUpdateJob(const HttpJob& job,
                 if (dryRun) {
                     ++copied;
                     noteChange(copyPrefix, entry.relStr);
+                    markChangedFileRel(entry.rel);
                     continue;
                 }
                 std::filesystem::create_directories(dstPath.parent_path(), ec);
@@ -2532,6 +2560,7 @@ bool PerformUpdateJob(const HttpJob& job,
                 }
                 ++copied;
                 noteChange(copyPrefix, entry.relStr);
+                markChangedFileRel(entry.rel);
                 std::string winTimeError;
                 if (!WinSetLastWriteTime(dstPath, entry.writeTime, false, &winTimeError)) {
                     ++failed;
@@ -2575,6 +2604,9 @@ bool PerformUpdateJob(const HttpJob& job,
     }
 
     auto noteDirTimeChange = [&](const std::filesystem::path& relPath) {
+        if (!shouldUpdateDirTs(relPath)) {
+            return;
+        }
         std::string relStr;
         if (relPath.empty() || relPath == ".") {
             relStr = ".";
@@ -2584,6 +2616,64 @@ bool PerformUpdateJob(const HttpJob& job,
         ++dirTs;
         noteChange("dir_ts ", relStr);
     };
+
+    ec.clear();
+    std::filesystem::recursive_directory_iterator dit(dst, options, ec);
+    while (dit != end) {
+        if (ec) {
+            ec.clear();
+            dit.increment(ec);
+            continue;
+        }
+        std::filesystem::path relPath = dit->path().lexically_relative(dst);
+        std::string rel = relPath.generic_string();
+        if (IsExcludedRelPath(rel, job.update_excludes)) {
+            if (dit->is_directory()) {
+                dit.disable_recursion_pending();
+            }
+            dit.increment(ec);
+            continue;
+        }
+        if (dit->is_directory()) {
+            dit.increment(ec);
+            continue;
+        }
+        if (!dit->is_regular_file()) {
+            dit.increment(ec);
+            continue;
+        }
+        std::filesystem::path srcPath = src / relPath;
+        std::error_code existsEc;
+        bool exists = GetPathInfo(srcPath, nullptr, &existsEc);
+        if (existsEc) {
+            recordFailure("exists " + rel + " (ec=" + formatEc(existsEc) + ")");
+            ++deleteFailed;
+            ++failed;
+            existsEc.clear();
+            dit.increment(ec);
+            continue;
+        }
+        if (!exists) {
+            if (dryRun) {
+                ++deleted;
+                noteChange(deletePrefix, rel);
+                markChangedFileRel(relPath);
+            } else {
+                std::filesystem::remove(dit->path(), ec);
+                if (ec) {
+                    recordFailure("delete " + rel + " (ec=" + formatEc(ec) + ")");
+                    ++deleteFailed;
+                    ++failed;
+                    ec.clear();
+                } else {
+                    ++deleted;
+                    noteChange(deletePrefix, rel);
+                    markChangedFileRel(relPath);
+                }
+            }
+        }
+        dit.increment(ec);
+    }
 
     if (dryRun) {
 #ifdef _WIN32
@@ -2672,62 +2762,6 @@ bool PerformUpdateJob(const HttpJob& job,
 #endif
     }
 
-    ec.clear();
-    std::filesystem::recursive_directory_iterator dit(dst, options, ec);
-    while (dit != end) {
-        if (ec) {
-            ec.clear();
-            dit.increment(ec);
-            continue;
-        }
-        std::filesystem::path relPath = dit->path().lexically_relative(dst);
-        std::string rel = relPath.generic_string();
-        if (IsExcludedRelPath(rel, job.update_excludes)) {
-            if (dit->is_directory()) {
-                dit.disable_recursion_pending();
-            }
-            dit.increment(ec);
-            continue;
-        }
-        if (dit->is_directory()) {
-            dit.increment(ec);
-            continue;
-        }
-        if (!dit->is_regular_file()) {
-            dit.increment(ec);
-            continue;
-        }
-        std::filesystem::path srcPath = src / relPath;
-        std::error_code existsEc;
-        bool exists = GetPathInfo(srcPath, nullptr, &existsEc);
-        if (existsEc) {
-            recordFailure("exists " + rel + " (ec=" + formatEc(existsEc) + ")");
-            ++deleteFailed;
-            ++failed;
-            existsEc.clear();
-            dit.increment(ec);
-            continue;
-        }
-        if (!exists) {
-            if (dryRun) {
-                ++deleted;
-                noteChange(deletePrefix, rel);
-            } else {
-                std::filesystem::remove(dit->path(), ec);
-                if (ec) {
-                    recordFailure("delete " + rel + " (ec=" + formatEc(ec) + ")");
-                    ++deleteFailed;
-                    ++failed;
-                    ec.clear();
-                } else {
-                    ++deleted;
-                    noteChange(deletePrefix, rel);
-                }
-            }
-        }
-        dit.increment(ec);
-    }
-
     if (!dryRun) {
         std::vector<std::filesystem::path> dirs;
         ec.clear();
@@ -2804,6 +2838,9 @@ bool PerformUpdateJob(const HttpJob& job,
             });
         EnsureUpdatePrivileges();
         auto setDirTimeWin = [&](const std::filesystem::path& relPath) {
+            if (!shouldUpdateDirTs(relPath)) {
+                return;
+            }
             std::filesystem::path srcPath = (relPath.empty() || relPath == ".") ? src : (src / relPath);
             WinFileInfo srcInfo;
             std::string srcErr;
@@ -2854,6 +2891,9 @@ bool PerformUpdateJob(const HttpJob& job,
         {
             for (const auto& entry : sourceDirTimes) {
                 const std::filesystem::path& relPath = entry.first;
+                if (!shouldUpdateDirTs(relPath)) {
+                    continue;
+                }
                 const auto& dirTime = entry.second;
                 std::filesystem::path dstPath;
                 if (relPath.empty() || relPath == ".") {
