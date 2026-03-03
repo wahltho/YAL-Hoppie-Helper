@@ -43,8 +43,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "1.7";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.7";
+constexpr const char* kPluginVersion = "1.8";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.8";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
@@ -199,6 +199,7 @@ bool g_sendPending = false;
 bool g_pollPending = false;
 double g_nextPollTime = 0.0;
 int g_debugLevel = 1;
+std::string g_debugLevelSource;
 std::string g_lastStatus;
 bool g_refsReady = false;
 bool g_loggedMissingRefs = false;
@@ -949,23 +950,43 @@ void SetLastHttp(const std::string& info) {
     }
 }
 
-int GetDebugLevel() {
-    if (g_autarkMode) {
-        if (g_autarkConfig.hasDebug) {
-            int level = g_autarkConfig.debugLevel;
-            if (level < 0) level = 0;
-            if (level > 3) level = 3;
-            return level;
-        }
-        return 1;
-    }
-    if (!g_dref.debug_level) {
-        return 1;
-    }
-    int level = XPLMGetDatai(g_dref.debug_level);
+int ClampDebugLevel(int level) {
     if (level < 0) level = 0;
     if (level > 3) level = 3;
     return level;
+}
+
+int GetDebugLevel(std::string* source) {
+    if (!g_dref.debug_level) {
+        g_dref.debug_level = XPLMFindDataRef("YAL/hoppie/debug_level");
+    }
+    if (g_dref.debug_level) {
+        if (source) {
+            *source = "YAL/hoppie/debug_level";
+        }
+        return ClampDebugLevel(XPLMGetDatai(g_dref.debug_level));
+    }
+    if (g_autarkMode && g_autarkConfig.hasDebug) {
+        if (source) {
+            *source = "prefs debug_level";
+        }
+        return ClampDebugLevel(g_autarkConfig.debugLevel);
+    }
+    if (source) {
+        *source = "default";
+    }
+    return 1;
+}
+
+void RefreshDebugLevel() {
+    std::string source;
+    int level = GetDebugLevel(&source);
+    if (level == g_debugLevel && source == g_debugLevelSource) {
+        return;
+    }
+    g_debugLevel = level;
+    g_debugLevelSource = source;
+    LogAlways("Debug level set to " + std::to_string(level) + " (" + source + ").");
 }
 
 std::string Trim(const std::string& s) {
@@ -4232,7 +4253,7 @@ float FlightLoopCallback(float, float, int, void*) {
         TriggerReload("post-update");
     }
     AutarkUpdate autarkUpdate = UpdateAutarkConfig(now);
-    g_debugLevel = GetDebugLevel();
+    RefreshDebugLevel();
     if (autarkUpdate.modeChanged) {
         ResetOperationalState(now);
         g_nextPollTime = 0.0;
@@ -4496,7 +4517,8 @@ PLUGIN_API int XPluginEnable() {
     g_autarkConfig = AutarkConfig{};
     g_autarkAppliedCallsign.clear();
     AutarkUpdate autarkUpdate = UpdateAutarkConfig(XPLMGetElapsedTime());
-    g_debugLevel = GetDebugLevel();
+    g_debugLevelSource.clear();
+    RefreshDebugLevel();
     if (autarkUpdate.modeChanged && g_autarkMode) {
         Log(LOG_INFO, "Autark mode enabled (prefs file found).");
     }
