@@ -43,8 +43,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "1.8";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.8";
+constexpr const char* kPluginVersion = "1.9";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.9";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
@@ -3971,12 +3971,11 @@ void DrainResults(bool allowDelivery) {
             if (res.ok) {
                 bool okOnly = IsOkOnlyCaseInsensitive(res.response);
                 bool wasCommEstablished = g_commEstablished;
-                if (okOnly) {
-                    if (!g_commEstablished) {
-                        Log(LOG_INFO, "Poll ok. Communication ready.");
-                    }
-                    g_commEstablished = true;
+                if (!g_commEstablished) {
+                    Log(LOG_INFO, "Poll ok. Communication ready.");
                 }
+                // Any successful poll (including polls with messages) proves the link is usable.
+                g_commEstablished = true;
                 if (!okOnly) {
                     LogWire("RX poll http=" + std::to_string(res.httpCode)
                         + " body=" + QuoteForLog(res.response));
