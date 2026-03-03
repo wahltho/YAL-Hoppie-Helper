@@ -43,8 +43,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "1.6";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.6";
+constexpr const char* kPluginVersion = "1.7";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.7";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
@@ -377,6 +377,10 @@ void Log(LogLevel level, const std::string& msg) {
 void LogAlways(const std::string& msg) {
     std::string line = std::string("[YAL HoppieHelper] ") + msg + "\n";
     XPLMDebugString(line.c_str());
+}
+
+void LogWire(const std::string& msg) {
+    Log(LOG_DBG, msg);
 }
 
 bool PointInRect(int x, int y, const UiRect& rect) {
@@ -3019,7 +3023,7 @@ bool IsZiboTailnum(const std::string& tailnum) {
         return true;
     }
     std::string prefix4 = tailnum.substr(0, std::min<size_t>(4, tailnum.size()));
-    return prefix4 == "B736" || prefix4 == "B737" || prefix4 == "B739" || prefix4 == "738";
+    return prefix4 == "B736" || prefix4 == "B737" || prefix4 == "B738" || prefix4 == "B739" || prefix4 == "738";
 }
 
 bool UpdateZiboState() {
@@ -3485,6 +3489,10 @@ std::string JsonEscape(const std::string& s) {
     return out;
 }
 
+std::string QuoteForLog(const std::string& s) {
+    return "\"" + JsonEscape(s) + "\"";
+}
+
 #ifndef _WIN32
 size_t CurlWrite(void* contents, size_t size, size_t nmemb, void* userp) {
     size_t total = size * nmemb;
@@ -3838,6 +3846,11 @@ void QueueInboundMessage(const std::string& origin, const std::string& raw) {
         return;
     }
     for (auto& msg : messages) {
+        std::string payload = msg.packet.empty() ? msg.raw : msg.packet;
+        LogWire("RX message origin=" + msg.origin
+            + " from=" + msg.from
+            + " type=" + msg.type
+            + " payload=" + QuoteForLog(payload));
         if (InboxHasMessage()) {
             g_pendingInbox.push_back(std::move(msg));
             Log(LOG_INFO, "Inbox busy; queued " + origin + " message.");
@@ -3921,11 +3934,15 @@ void DrainResults(bool allowDelivery) {
                 }
                 SetLastError("");
                 SetLastHttp("send: " + std::to_string(res.httpCode));
+                LogWire("TX result http=" + std::to_string(res.httpCode)
+                    + " body=" + QuoteForLog(res.response));
                 Log(LOG_INFO, "Send ok: " + Trim(res.response));
                 QueueInboundMessage("response", res.response);
             } else {
                 SetLastError("Send failed: " + res.error);
                 SetLastHttp("send: " + std::to_string(res.httpCode));
+                LogWire("TX failed http=" + std::to_string(res.httpCode)
+                    + " error=" + QuoteForLog(res.error));
             }
         } else if (res.type == JobType::Poll) {
             g_pollPending = false;
@@ -3939,6 +3956,10 @@ void DrainResults(bool allowDelivery) {
                     }
                     g_commEstablished = true;
                 }
+                if (!okOnly) {
+                    LogWire("RX poll http=" + std::to_string(res.httpCode)
+                        + " body=" + QuoteForLog(res.response));
+                }
                 if (!okOnly || wasCommEstablished) {
                     QueueInboundMessage("poll", res.response);
                 }
@@ -3947,6 +3968,8 @@ void DrainResults(bool allowDelivery) {
             } else {
                 SetLastError("Poll failed: " + res.error);
                 SetLastHttp("poll: " + std::to_string(res.httpCode));
+                LogWire("RX poll failed http=" + std::to_string(res.httpCode)
+                    + " error=" + QuoteForLog(res.error));
             }
         } else if (res.type == JobType::UpdateScan) {
             g_updateScanPending = false;
@@ -4274,6 +4297,7 @@ float FlightLoopCallback(float, float, int, void*) {
         std::string to = Trim(GetDataRefString(g_dref.send_message_to));
         std::string type = Trim(GetDataRefString(g_dref.send_message_type));
         std::string packet = Trim(GetDataRefString(g_dref.send_message_packet));
+        bool usedLegacySendQueue = false;
         bool structuredReady = !to.empty() && !type.empty() && !packet.empty();
         bool structuredPartial = !to.empty() || !type.empty() || !packet.empty();
         if (!structuredReady) {
@@ -4288,6 +4312,7 @@ float FlightLoopCallback(float, float, int, void*) {
                     type = legacy.type;
                     packet = legacy.packet;
                     structuredReady = true;
+                    usedLegacySendQueue = true;
                     g_lastBadSendQueue.clear();
                 } else if (legacyRaw != g_lastBadSendQueue) {
                     g_lastBadSendQueue = legacyRaw;
@@ -4303,6 +4328,11 @@ float FlightLoopCallback(float, float, int, void*) {
             job.to = to;
             job.msg_type = type;
             job.packet = packet;
+            LogWire("TX enqueue from=" + callsign
+                + " to=" + to
+                + " type=" + type
+                + " source=" + (usedLegacySendQueue ? "send_queue" : "structured")
+                + " packet=" + QuoteForLog(packet));
             EnqueueJob(job);
             g_sendPending = true;
             ScheduleNextPollTime(now);
