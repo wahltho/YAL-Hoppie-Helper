@@ -43,8 +43,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "1.9";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v1.9";
+constexpr const char* kPluginVersion = "2.0";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v2.0";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
@@ -130,6 +130,8 @@ std::array<OwnedDataRef, 16> g_ownedDataRefs = {{
 
 DataRefs g_dref;
 std::atomic<bool> g_running{false};
+std::atomic<bool> g_hoppiePassiveMode{false};
+std::atomic<bool> g_workerActive{false};
 std::thread g_worker;
 XPLMCommandRef g_reloadCmd = nullptr;
 bool g_loggedReloadCmdMissing = false;
@@ -278,6 +280,13 @@ bool g_autarkMode = false;
 AutarkConfig g_autarkConfig;
 std::string g_autarkAppliedCallsign;
 double g_nextPrefScanTime = 0.0;
+double g_nextZiboHoppiePrefScanTime = 0.0;
+
+struct ZiboHoppieConfig {
+    bool filePresent = false;
+    bool enabled = false;
+    std::string logon;
+};
 
 struct UpdateConfig {
     bool enabled = false;
@@ -315,14 +324,20 @@ int GetDatabCB(void* refcon, void* outValue, int offset, int max);
 void SetDatabCB(void* refcon, void* inValue, int offset, int max);
 std::string Trim(const std::string& s);
 std::string ToLower(const std::string& s);
+std::string StripQuotes(const std::string& s);
+bool ParseBool(const std::string& s, bool* out);
 std::string GetAutarkPrefPath();
+std::string GetZiboHoppiePrefPath();
+bool LoadZiboHoppieConfig(ZiboHoppieConfig* config);
 std::string BuildUpdatePathError(const char* label, const std::filesystem::path& path, const std::error_code& ec);
 bool HasCoreDataRefs();
 void RefreshDataRefs(double now);
+void FindDataRefs();
 void RefreshHbdrReady(bool allowReady);
 void EnsureHoppieDataRefs();
 void UnregisterHoppieDataRefs();
 AutarkUpdate UpdateAutarkConfig(double now);
+bool UpdateZiboHoppiePassiveMode(double now);
 bool TriggerReload(const char* reason);
 std::string GetActiveLogon();
 bool ApplyAutarkCallsign(std::string* callsign);
@@ -337,7 +352,8 @@ void LogLogonState(const std::string& logon);
 bool IsZiboPluginLoaded();
 bool IsZiboTailnum(const std::string& tailnum);
 bool UpdateZiboState();
-void ResetOperationalState(double now);
+bool IsHoppiePassiveMode();
+void ResetHoppieRuntimeState(double now, bool clearBridgeOutputs);
 bool InboxHasMessage();
 bool BuildInboundMessage(const std::string& origin, const std::string& raw, InboundMessage* out);
 bool BuildInboundMessages(const std::string& origin, const std::string& raw, std::vector<InboundMessage>* out);
@@ -345,6 +361,8 @@ void ApplyInboxMessage(const InboundMessage& msg);
 bool ParseLegacyOutboxMessage(const std::string& raw, LegacyOutboxMessage* out);
 void QueueInboundMessage(const std::string& origin, const std::string& raw);
 void DeliverQueuedInboxIfEmpty();
+void DropQueuedHoppieJobs();
+void EnsureWorkerThread();
 void EnqueueJob(const HttpJob& job);
 bool IsExcludedRelPath(const std::string& rel, const std::vector<std::string>& excludes);
 bool PerformUpdateJob(const HttpJob& job,
@@ -1412,6 +1430,54 @@ std::string GetAutarkPrefPath() {
     return dir + "/YAL_HoppieHelper.prf";
 }
 
+std::string GetZiboHoppiePrefPath() {
+    std::string dir = GetPrefsDir();
+    if (dir.empty()) {
+        return "";
+    }
+    return dir + "/b738x_hoppie.prf";
+}
+
+bool LoadZiboHoppieConfig(ZiboHoppieConfig* config) {
+    if (!config) {
+        return false;
+    }
+    *config = ZiboHoppieConfig{};
+    std::string path = GetZiboHoppiePrefPath();
+    if (path.empty()) {
+        return false;
+    }
+
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        return false;
+    }
+
+    config->filePresent = true;
+    std::string line;
+    while (std::getline(file, line)) {
+        std::string trimmed = Trim(line);
+        if (trimmed.empty() || trimmed[0] == '#' || trimmed[0] == ';') {
+            continue;
+        }
+        size_t eq = trimmed.find('=');
+        if (eq == std::string::npos) {
+            continue;
+        }
+        std::string keyLower = ToLower(Trim(trimmed.substr(0, eq)));
+        std::string value = Trim(StripQuotes(trimmed.substr(eq + 1)));
+        if (keyLower == "enabled") {
+            bool enabled = false;
+            if (ParseBool(value, &enabled)) {
+                config->enabled = enabled;
+            }
+        } else if (keyLower == "logon") {
+            config->logon = Trim(value);
+        }
+    }
+    return true;
+}
+
 std::string BuildUpdatePathError(const char* label, const std::filesystem::path& path, const std::error_code& ec) {
     std::ostringstream oss;
     if (label && *label) {
@@ -2112,6 +2178,25 @@ AutarkUpdate UpdateAutarkConfig(double now) {
         }
     }
     return update;
+}
+
+bool UpdateZiboHoppiePassiveMode(double now) {
+    if (now < g_nextZiboHoppiePrefScanTime) {
+        return false;
+    }
+    g_nextZiboHoppiePrefScanTime = now + 2.0;
+
+    ZiboHoppieConfig config;
+    LoadZiboHoppieConfig(&config);
+    bool passive = config.filePresent && config.enabled && !Trim(config.logon).empty();
+    bool changed = passive != g_hoppiePassiveMode.load();
+    if (changed) {
+        g_hoppiePassiveMode.store(passive);
+        LogAlways(passive
+            ? "YAL_hoppiehelper: Hoppie passive, internal Zibo Hoppie enabled"
+            : "YAL_hoppiehelper: Hoppie active, internal Zibo Hoppie disabled");
+    }
+    return changed;
 }
 
 std::filesystem::path GetXPlaneRootPath() {
@@ -3091,26 +3176,20 @@ bool UpdateZiboState() {
     return ready;
 }
 
-void ResetOperationalState(double now) {
+bool IsHoppiePassiveMode() {
+    return g_hoppiePassiveMode.load();
+}
+
+void ResetHoppieRuntimeState(double now, bool clearBridgeOutputs) {
     g_refsReady = false;
     g_nextRefScanTime = now;
     g_nextPollTime = 0.0;
     g_commEstablished = false;
     g_sendPending = false;
     g_pollPending = false;
-    g_updatePending = false;
-    g_reloadAfterUpdate = false;
-    g_reloadAfterUpdateAt = 0.0;
-    g_updateScanPending = false;
-    g_updateDecisionPending = false;
-    g_updateErrorPending = false;
-    g_reloadAfterErrorAck = false;
-    g_updateErrorReloadReason.clear();
-    g_reloadRequested = false;
-    g_updatePlanValid = false;
-    g_updateShowResultPopup = false;
-    HideUpdatePopup();
-    SetDataRefBool(g_dref.comm_ready, false);
+    if (clearBridgeOutputs) {
+        SetDataRefBool(g_dref.comm_ready, false);
+    }
     g_loggedMissingRefs = false;
     g_loggedStartupSummary = false;
     g_commReadyKnown = false;
@@ -3120,6 +3199,7 @@ void ResetOperationalState(double now) {
     g_logonKnown = false;
     g_logonAvailable = false;
     g_lastCallsign.clear();
+    g_lastBadSendQueue.clear();
     g_autarkAppliedCallsign.clear();
     g_pendingInbox.clear();
 }
@@ -3902,13 +3982,21 @@ bool AreCommPrereqsReady(const std::string& logon, const std::string& callsign, 
 }
 
 void WorkerLoop() {
+    using namespace std::chrono_literals;
+
     while (g_running.load()) {
         HttpJob job;
         {
             std::unique_lock<std::mutex> lock(g_mutex);
-            g_cv.wait(lock, [] { return !g_jobs.empty() || !g_running.load(); });
+            g_cv.wait_for(lock, 2s, [] { return !g_jobs.empty() || !g_running.load(); });
             if (!g_running.load()) {
-                return;
+                break;
+            }
+            if (g_jobs.empty()) {
+                if (IsHoppiePassiveMode()) {
+                    break;
+                }
+                continue;
             }
             job = g_jobs.front();
             g_jobs.pop();
@@ -3919,15 +4007,44 @@ void WorkerLoop() {
             g_results.push(result);
         }
     }
+    g_workerActive.store(false);
+}
+
+void DropQueuedHoppieJobs() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    std::queue<HttpJob> kept;
+    while (!g_jobs.empty()) {
+        HttpJob job = g_jobs.front();
+        g_jobs.pop();
+        if (job.type == JobType::Update || job.type == JobType::UpdateScan) {
+            kept.push(std::move(job));
+        }
+    }
+    std::swap(g_jobs, kept);
+}
+
+void EnsureWorkerThread() {
+    if (!g_running.load()) {
+        return;
+    }
+    if (g_worker.joinable() && !g_workerActive.load()) {
+        g_worker.join();
+    }
+    if (g_worker.joinable()) {
+        return;
+    }
+    g_workerActive.store(true);
+    g_worker = std::thread(WorkerLoop);
 }
 
 void EnqueueJob(const HttpJob& job) {
+    EnsureWorkerThread();
     std::lock_guard<std::mutex> lock(g_mutex);
     g_jobs.push(job);
     g_cv.notify_one();
 }
 
-void DrainResults(bool allowDelivery) {
+void DrainResults(bool allowHoppieDelivery) {
     std::queue<HttpResult> results;
     {
         std::lock_guard<std::mutex> lock(g_mutex);
@@ -3936,11 +4053,12 @@ void DrainResults(bool allowDelivery) {
     while (!results.empty()) {
         HttpResult res = results.front();
         results.pop();
-        if (!allowDelivery) {
-            g_sendPending = false;
-            g_pollPending = false;
-            g_updatePending = false;
-            g_reloadAfterUpdate = false;
+        if ((res.type == JobType::Send || res.type == JobType::Poll) && !allowHoppieDelivery) {
+            if (res.type == JobType::Send) {
+                g_sendPending = false;
+            } else {
+                g_pollPending = false;
+            }
             continue;
         }
         if (res.type == JobType::Send) {
@@ -4252,28 +4370,51 @@ float FlightLoopCallback(float, float, int, void*) {
         TriggerReload("post-update");
     }
     AutarkUpdate autarkUpdate = UpdateAutarkConfig(now);
+    bool passiveChanged = UpdateZiboHoppiePassiveMode(now);
     RefreshDebugLevel();
+
+    if (passiveChanged && IsHoppiePassiveMode()) {
+        DropQueuedHoppieJobs();
+        ResetHoppieRuntimeState(now, false);
+        UnregisterHoppieDataRefs();
+        FindDataRefs();
+        g_cv.notify_all();
+    }
+    if (passiveChanged && !IsHoppiePassiveMode()) {
+        ResetHoppieRuntimeState(now, false);
+        FindDataRefs();
+    }
     if (autarkUpdate.modeChanged) {
-        ResetOperationalState(now);
+        ResetHoppieRuntimeState(now, !IsHoppiePassiveMode());
         g_nextPollTime = 0.0;
         g_autarkAppliedCallsign.clear();
         Log(LOG_INFO, g_autarkMode
             ? "Autark mode enabled (prefs file found)."
             : "Autark mode disabled (prefs file missing).");
     }
-    if (g_autarkMode && autarkUpdate.logonChanged) {
+    if (g_autarkMode && autarkUpdate.logonChanged && !IsHoppiePassiveMode()) {
         g_commEstablished = false;
         SetDataRefBool(g_dref.comm_ready, false);
         g_nextPollTime = 0.0;
         g_logonKnown = false;
         g_logonAvailable = false;
     }
-    ApplyAutarkPollFastOverride();
+    if (!IsHoppiePassiveMode()) {
+        ApplyAutarkPollFastOverride();
+    }
+
+    if (HandleReloadRequest()) {
+        return kFlightLoopInterval;
+    }
+    if (IsHoppiePassiveMode()) {
+        DrainResults(false);
+        return kFlightLoopInterval;
+    }
 
     bool ziboReady = UpdateZiboState();
     if (!ziboReady) {
         if (g_refsReady || g_commEstablished || g_sendPending || g_pollPending || !g_pendingInbox.empty()) {
-            ResetOperationalState(now);
+            ResetHoppieRuntimeState(now, true);
         }
         RefreshHbdrReady(false);
         DrainResults(false);
@@ -4288,9 +4429,6 @@ float FlightLoopCallback(float, float, int, void*) {
         DrainResults(false);
         SetDataRefBool(g_dref.comm_ready, false);
         SetStatus("WAIT_YAL");
-        return kFlightLoopInterval;
-    }
-    if (HandleReloadRequest()) {
         return kFlightLoopInterval;
     }
 
@@ -4407,7 +4545,7 @@ void FindDataRefs() {
     g_dref.avionics_on = XPLMFindDataRef("sim/cockpit/electrical/avionics_on");
     g_dref.tailnum = XPLMFindDataRef("sim/aircraft/view/acf_tailnum");
 
-    if (!g_dref.logon && !g_autarkMode) {
+    if (!g_dref.logon && !g_autarkMode && !IsHoppiePassiveMode()) {
         Log(LOG_DBG, "Missing dataref: YAL/hoppie/logon");
     }
 }
@@ -4453,9 +4591,14 @@ void RefreshHbdrReady(bool allowReady) {
 }
 
 void RefreshDataRefs(double now) {
+    if (IsHoppiePassiveMode()) {
+        g_refsReady = false;
+        g_nextRefScanTime = now + 2.0;
+        return;
+    }
     if (g_refsReady) {
         if (!HasCoreDataRefs()) {
-            ResetOperationalState(now);
+            ResetHoppieRuntimeState(now, true);
             Log(LOG_ERR, "Lost required datarefs. Will retry.");
         }
         return;
@@ -4492,7 +4635,6 @@ PLUGIN_API int XPluginStart(char* outName, char* outSig, char* outDesc) {
 #ifndef _WIN32
     curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
-    EnsureHoppieDataRefs();
     FindDataRefs();
     return 1;
 }
@@ -4506,23 +4648,33 @@ PLUGIN_API void XPluginStop() {
 }
 
 PLUGIN_API int XPluginEnable() {
+    double now = XPLMGetElapsedTime();
     g_running.store(true);
-    g_worker = std::thread(WorkerLoop);
-    EnsureHoppieDataRefs();
-    FindDataRefs();
+    g_workerActive.store(false);
     g_nextPollTime = 0.0;
     g_nextPrefScanTime = 0.0;
+    g_nextZiboHoppiePrefScanTime = 0.0;
     g_autarkMode = false;
     g_autarkConfig = AutarkConfig{};
     g_autarkAppliedCallsign.clear();
-    AutarkUpdate autarkUpdate = UpdateAutarkConfig(XPLMGetElapsedTime());
+    g_hoppiePassiveMode.store(false);
+    AutarkUpdate autarkUpdate = UpdateAutarkConfig(now);
+    UpdateZiboHoppiePassiveMode(now);
+    if (!IsHoppiePassiveMode()) {
+        EnsureHoppieDataRefs();
+    } else {
+        UnregisterHoppieDataRefs();
+    }
+    FindDataRefs();
     g_debugLevelSource.clear();
     RefreshDebugLevel();
     if (autarkUpdate.modeChanged && g_autarkMode) {
         Log(LOG_INFO, "Autark mode enabled (prefs file found).");
     }
-    ApplyAutarkPollFastOverride();
-    g_refsReady = HasCoreDataRefs();
+    if (!IsHoppiePassiveMode()) {
+        ApplyAutarkPollFastOverride();
+    }
+    g_refsReady = !IsHoppiePassiveMode() && HasCoreDataRefs();
     g_loggedMissingRefs = false;
     g_nextRefScanTime = 0.0;
     g_loggedStartupSummary = false;
@@ -4541,17 +4693,23 @@ PLUGIN_API int XPluginEnable() {
     g_tailnumKnown = false;
     g_lastTailnumMatches = false;
     g_lastTailnum.clear();
-    if (!g_refsReady) {
+    if (IsHoppiePassiveMode()) {
+        DropQueuedHoppieJobs();
+    } else if (!g_refsReady) {
         g_loggedMissingRefs = true;
         Log(LOG_INFO, g_autarkMode ? "Waiting for core datarefs..." : "Waiting for YAL datarefs...");
     } else {
         Log(LOG_INFO, "Required datarefs found. Helper ready.");
         LogReadySummary();
     }
-    RefreshHbdrReady(g_refsReady);
+    if (!IsHoppiePassiveMode()) {
+        RefreshHbdrReady(g_refsReady);
+    }
     XPLMRegisterFlightLoopCallback(FlightLoopCallback, kFlightLoopInterval, nullptr);
     g_commEstablished = false;
-    SetDataRefBool(g_dref.comm_ready, false);
+    if (!IsHoppiePassiveMode()) {
+        SetDataRefBool(g_dref.comm_ready, false);
+    }
     SetDataRefString(g_dref.last_error, "");
     SetDataRefString(g_dref.last_http, "");
     if (g_dref.send_count) {
@@ -4566,15 +4724,19 @@ PLUGIN_API int XPluginEnable() {
 }
 
 PLUGIN_API void XPluginDisable() {
+    bool passive = IsHoppiePassiveMode();
     XPLMUnregisterFlightLoopCallback(FlightLoopCallback, nullptr);
     g_running.store(false);
     g_cv.notify_all();
     if (g_worker.joinable()) {
         g_worker.join();
     }
+    g_workerActive.store(false);
     g_commEstablished = false;
-    SetDataRefBool(g_dref.comm_ready, false);
-    SetDataRefBool(g_dref.hbdr_ready, false);
+    if (!passive) {
+        SetDataRefBool(g_dref.comm_ready, false);
+        SetDataRefBool(g_dref.hbdr_ready, false);
+    }
     g_loggedHbdrFound = false;
     g_loggedHbdrWritable = false;
     g_loggedHbdrTypes = false;
@@ -4598,6 +4760,8 @@ PLUGIN_API void XPluginDisable() {
     g_autarkConfig = AutarkConfig{};
     g_autarkAppliedCallsign.clear();
     g_nextPrefScanTime = 0.0;
+    g_nextZiboHoppiePrefScanTime = 0.0;
+    g_hoppiePassiveMode.store(false);
     if (g_updateWindow) {
         SaveUpdateWindowPosition();
         XPLMDestroyWindow(g_updateWindow);
