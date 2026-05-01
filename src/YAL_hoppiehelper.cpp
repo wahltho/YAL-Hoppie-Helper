@@ -43,8 +43,8 @@ namespace {
 
 constexpr const char* kPluginName = "YAL_hoppiehelper";
 constexpr const char* kPluginSig = "yal.hoppiehelper";
-constexpr const char* kPluginVersion = "2.0";
-constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v2.0";
+constexpr const char* kPluginVersion = "2.1";
+constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v2.1";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
 
@@ -109,7 +109,7 @@ struct OwnedDataRef {
     bool owned = false;
 };
 
-std::array<OwnedDataRef, 16> g_ownedDataRefs = {{
+std::array<OwnedDataRef, 14> g_ownedDataRefs = {{
     {"hoppiebridge/send_queue", xplmType_Data, true},
     {"hoppiebridge/send_message_to", xplmType_Data, true},
     {"hoppiebridge/send_message_type", xplmType_Data, true},
@@ -124,8 +124,6 @@ std::array<OwnedDataRef, 16> g_ownedDataRefs = {{
     {"hoppiebridge/poll_queue_clear", kNumberDataRefTypes, false},
     {"hoppiebridge/callsign", xplmType_Data, true},
     {"hoppiebridge/comm_ready", kNumberDataRefTypes, false},
-    {"YAL/hoppie/voice_seq", xplmType_Int, false},
-    {"YAL/hoppie/voice_text", xplmType_Data, true},
 }};
 
 DataRefs g_dref;
@@ -175,6 +173,8 @@ struct HttpResult {
     std::string response;
     std::string error;
     long httpCode = 0;
+    std::string requestTo;
+    std::string requestMsgType;
     std::vector<std::string> update_log_lines;
     size_t update_log_omitted = 0;
     UpdateCounters update_counts;
@@ -357,9 +357,13 @@ void ResetHoppieRuntimeState(double now, bool clearBridgeOutputs);
 bool InboxHasMessage();
 bool BuildInboundMessage(const std::string& origin, const std::string& raw, InboundMessage* out);
 bool BuildInboundMessages(const std::string& origin, const std::string& raw, std::vector<InboundMessage>* out);
+void RefreshOptionalYalVoiceDataRefs();
+void NormalizeDirectInfoResponse(InboundMessage* msg, const std::string& requestTo, const std::string& requestMsgType);
+bool IsPlainAckMessage(const InboundMessage& msg);
+bool ShouldPublishVoiceMessage(const InboundMessage& msg);
 void ApplyInboxMessage(const InboundMessage& msg);
 bool ParseLegacyOutboxMessage(const std::string& raw, LegacyOutboxMessage* out);
-void QueueInboundMessage(const std::string& origin, const std::string& raw);
+void QueueInboundMessage(const std::string& origin, const std::string& raw, const std::string& requestTo = "", const std::string& requestMsgType = "");
 void DeliverQueuedInboxIfEmpty();
 void DropQueuedHoppieJobs();
 void EnsureWorkerThread();
@@ -3275,7 +3279,9 @@ void SetDataRefString(XPLMDataRef dr, const std::string& value) {
         XPLMSetDatab(dr, const_cast<char*>(&zero), 0, 1);
         return;
     }
-    XPLMSetDatab(dr, const_cast<char*>(value.data()), 0, static_cast<int>(value.size()));
+    std::string terminated = value;
+    terminated.push_back('\0');
+    XPLMSetDatab(dr, &terminated[0], 0, static_cast<int>(terminated.size()));
 }
 
 bool GetDataRefBool(XPLMDataRef dr) {
@@ -3823,6 +3829,8 @@ HttpResult RunHttpJob(const HttpJob& job) {
     result.response = resp;
     result.error = err;
     result.httpCode = httpCode;
+    result.requestTo = job.to;
+    result.requestMsgType = job.msg_type;
     return result;
 }
 
@@ -3916,7 +3924,44 @@ bool BuildInboundMessages(const std::string& origin, const std::string& raw, std
     return !out->empty();
 }
 
+void NormalizeDirectInfoResponse(InboundMessage* msg, const std::string& requestTo, const std::string& requestMsgType) {
+    if (!msg
+        || msg->origin != "response"
+        || requestTo != "SERVER"
+        || requestMsgType != "inforeq"
+        || !msg->from.empty()
+        || !msg->type.empty()) {
+        return;
+    }
+
+    std::string payload = Trim(msg->packet.empty() ? msg->raw : msg->packet);
+    if (payload.empty() || IsOkOnlyCaseInsensitive(payload)) {
+        return;
+    }
+
+    msg->from = "acars";
+    msg->type = "info";
+}
+
+bool IsPlainAckMessage(const InboundMessage& msg) {
+    if (!msg.from.empty() || !msg.type.empty()) {
+        return false;
+    }
+    return IsOkOnlyCaseInsensitive(msg.packet.empty() ? msg.raw : msg.packet);
+}
+
+bool ShouldPublishVoiceMessage(const InboundMessage& msg) {
+    std::string payload = Trim(msg.packet.empty() ? msg.raw : msg.packet);
+    return !payload.empty() && !IsPlainAckMessage(msg);
+}
+
+void RefreshOptionalYalVoiceDataRefs() {
+    g_dref.voice_seq = XPLMFindDataRef("YAL/hoppie/voice_seq");
+    g_dref.voice_text = XPLMFindDataRef("YAL/hoppie/voice_text");
+}
+
 void ApplyInboxMessage(const InboundMessage& msg) {
+    bool publishVoice = ShouldPublishVoiceMessage(msg);
     SetDataRefString(g_dref.poll_message_origin, msg.origin);
     SetDataRefString(g_dref.poll_message_from, msg.from);
     SetDataRefString(g_dref.poll_message_type, msg.type);
@@ -3926,12 +3971,15 @@ void ApplyInboxMessage(const InboundMessage& msg) {
     if (g_dref.poll_count) {
         XPLMSetDatai(g_dref.poll_count, XPLMGetDatai(g_dref.poll_count) + 1);
     }
-    if (g_dref.voice_seq) {
-        XPLMSetDatai(g_dref.voice_seq, XPLMGetDatai(g_dref.voice_seq) + 1);
+    if (publishVoice) {
+        RefreshOptionalYalVoiceDataRefs();
     }
-    if (g_dref.voice_text) {
+    if (publishVoice && g_dref.voice_text) {
         std::string voice = msg.packet.empty() ? msg.raw : msg.packet;
         SetDataRefString(g_dref.voice_text, voice);
+    }
+    if (publishVoice && g_dref.voice_seq) {
+        XPLMSetDatai(g_dref.voice_seq, XPLMGetDatai(g_dref.voice_seq) + 1);
     }
     std::string label = msg.origin == "response" ? "Response" : "Poll";
     if (!msg.from.empty() || !msg.type.empty()) {
@@ -3941,13 +3989,18 @@ void ApplyInboxMessage(const InboundMessage& msg) {
     }
 }
 
-void QueueInboundMessage(const std::string& origin, const std::string& raw) {
+void QueueInboundMessage(const std::string& origin, const std::string& raw, const std::string& requestTo, const std::string& requestMsgType) {
     std::vector<InboundMessage> messages;
     if (!BuildInboundMessages(origin, raw, &messages)) {
         return;
     }
     for (auto& msg : messages) {
+        NormalizeDirectInfoResponse(&msg, requestTo, requestMsgType);
         std::string payload = msg.packet.empty() ? msg.raw : msg.packet;
+        if (IsPlainAckMessage(msg)) {
+            LogWire("RX ack origin=" + msg.origin + " ignored payload=" + QuoteForLog(payload));
+            continue;
+        }
         LogWire("RX message origin=" + msg.origin
             + " from=" + msg.from
             + " type=" + msg.type
@@ -4076,7 +4129,7 @@ void DrainResults(bool allowHoppieDelivery) {
                 LogWire("TX result http=" + std::to_string(res.httpCode)
                     + " body=" + QuoteForLog(res.response));
                 Log(LOG_INFO, "Send ok: " + Trim(res.response));
-                QueueInboundMessage("response", res.response);
+                QueueInboundMessage("response", res.response, res.requestTo, res.requestMsgType);
             } else {
                 SetLastError("Send failed: " + res.error);
                 SetLastHttp("send: " + std::to_string(res.httpCode));
@@ -4085,10 +4138,8 @@ void DrainResults(bool allowHoppieDelivery) {
             }
         } else if (res.type == JobType::Poll) {
             g_pollPending = false;
-            double now = XPLMGetElapsedTime();
             if (res.ok) {
                 bool okOnly = IsOkOnlyCaseInsensitive(res.response);
-                bool wasCommEstablished = g_commEstablished;
                 if (!g_commEstablished) {
                     Log(LOG_INFO, "Poll ok. Communication ready.");
                 }
@@ -4098,7 +4149,7 @@ void DrainResults(bool allowHoppieDelivery) {
                     LogWire("RX poll http=" + std::to_string(res.httpCode)
                         + " body=" + QuoteForLog(res.response));
                 }
-                if (!okOnly || wasCommEstablished) {
+                if (!okOnly) {
                     QueueInboundMessage("poll", res.response);
                 }
                 SetLastError("");

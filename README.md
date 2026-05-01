@@ -10,4 +10,6 @@ Docs:
 - Install and deploy: `INSTALL.md`
 - Build instructions: `BUILD.md`
 
-Current plugin version: 2.0
+Local builds are configured to use `/Users/wahltho/dev/YAL Hoppiehelper/` as the build root so the source tree can stay in iCloud without putting CMake build directories there.
+
+Current plugin version: 2.1

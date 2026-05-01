@@ -22,7 +22,7 @@ X-Plane 12/
 - Linux: `lin.xpl`
 - Windows: `win.xpl`
 
-(You can take the files from `deploy/YAL_hoppiehelper/64` after a build.)
+(Use the staged files from `deploy/YAL_hoppiehelper/64` after a build. The active CMake build directories live outside the repo at `/Users/wahltho/dev/YAL Hoppiehelper/`.)
 
 ## Usage (YAL mode)
 - Logon is read from `YAL/hoppie/logon`.

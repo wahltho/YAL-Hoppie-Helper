@@ -1,0 +1,81 @@
+{
+  "version": 4,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 23,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "release-base",
+      "hidden": true,
+      "binaryDir": "/Users/wahltho/dev/YAL Hoppiehelper/${presetName}",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "XPLANE_SDK_PATH": "$env{XPLANE_SDK_PATH}"
+      }
+    },
+    {
+      "name": "build-mac",
+      "inherits": "release-base",
+      "generator": "Ninja"
+    },
+    {
+      "name": "build-mac-universal",
+      "inherits": "release-base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_OSX_ARCHITECTURES": "x86_64;arm64"
+      }
+    },
+    {
+      "name": "build-lin",
+      "inherits": "release-base",
+      "generator": "Ninja"
+    },
+    {
+      "name": "build-win",
+      "inherits": "release-base",
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_SYSTEM_NAME": "Windows",
+        "CMAKE_C_COMPILER": "x86_64-w64-mingw32-gcc-posix",
+        "CMAKE_CXX_COMPILER": "x86_64-w64-mingw32-g++-posix"
+      }
+    },
+    {
+      "name": "build-win-host",
+      "binaryDir": "/Users/wahltho/dev/YAL Hoppiehelper/build-win-host",
+      "generator": "Visual Studio 17 2022",
+      "architecture": {
+        "value": "x64"
+      },
+      "cacheVariables": {
+        "XPLANE_SDK_PATH": "$env{XPLANE_SDK_PATH}"
+      }
+    }
+  ],
+  "buildPresets": [
+    {
+      "name": "build-mac",
+      "configurePreset": "build-mac"
+    },
+    {
+      "name": "build-mac-universal",
+      "configurePreset": "build-mac-universal"
+    },
+    {
+      "name": "build-lin",
+      "configurePreset": "build-lin"
+    },
+    {
+      "name": "build-win",
+      "configurePreset": "build-win"
+    },
+    {
+      "name": "build-win-host",
+      "configurePreset": "build-win-host",
+      "configuration": "Release"
+    }
+  ]
+}

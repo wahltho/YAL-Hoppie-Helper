@@ -45,3 +45,4 @@ build-*/
 build*/
 deploy/
 temp/
+CURRENT_HANDOFF_STATUS.md
