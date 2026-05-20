@@ -47,6 +47,7 @@ constexpr const char* kPluginVersion = "2.1";
 constexpr const char* kPluginDesc = "HTTP helper for Hoppie ACARS (CPDLC) v2.1";
 constexpr const char* kHoppieUrl = "https://www.hoppie.nl/acars/system/connect.html";
 constexpr const char* kZiboPluginSig = "zibomod.by.Zibo";
+constexpr const char* kWahlthoModPluginSig = "wahlthomod.by.wahltho";
 
 constexpr float kFlightLoopInterval = 1.0f;
 constexpr int kPollDefaultMinSeconds = 45;
@@ -3121,7 +3122,8 @@ bool ApplyAutarkCallsign(std::string* callsign) {
 }
 
 bool IsZiboPluginLoaded() {
-    return XPLMFindPluginBySignature(kZiboPluginSig) != XPLM_NO_PLUGIN_ID;
+    return XPLMFindPluginBySignature(kZiboPluginSig) != XPLM_NO_PLUGIN_ID
+        || XPLMFindPluginBySignature(kWahlthoModPluginSig) != XPLM_NO_PLUGIN_ID;
 }
 
 bool IsZiboTailnum(const std::string& tailnum) {
