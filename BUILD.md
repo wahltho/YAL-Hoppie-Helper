@@ -123,3 +123,12 @@ cp -f "/Users/wahltho/dev/YAL Hoppiehelper/build-win/win.xpl" deploy/YAL_hoppieh
 # Windows (Visual Studio Generator):
 # cp -f "/Users/wahltho/dev/YAL Hoppiehelper/build-win-host/Release/win.xpl" deploy/YAL_hoppiehelper/64/win.xpl
 ```
+
+## GitHub Release Workflow
+- `.github/workflows/github-release.yml` packages the committed deploy artifacts into GitHub release assets.
+- Release assets:
+  - `YAL-HoppieHelper-<version>.zip`
+  - `YAL-HoppieHelper-<version>-manifest.txt`
+  - `YAL-HoppieHelper-<version>-manifest.json`
+  - `YAL-HoppieHelper-<version>-checksums.txt`
+- Rebuild and commit `deploy/YAL_HoppieHelper/64/*.xpl` before running the release workflow, because the workflow packages the binaries already stored in the repo.

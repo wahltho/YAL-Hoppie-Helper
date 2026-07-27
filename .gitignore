@@ -44,5 +44,6 @@
 build-*/
 build*/
 deploy/
+dist/
 temp/
 CURRENT_HANDOFF_STATUS.md
