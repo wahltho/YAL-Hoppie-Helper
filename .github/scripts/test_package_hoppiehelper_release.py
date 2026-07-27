@@ -59,7 +59,7 @@ class ReleasePackageTests(unittest.TestCase):
         self.assertEqual("r2.1b1", manifest["releaseTag"])
         self.assertEqual("beta", manifest["channel"])
         self.assertEqual("Resources/plugins/YAL_HoppieHelper", manifest["targetPath"])
-        self.assertEqual(["zibo-737ng"], manifest["supportedProducts"])
+        self.assertEqual(["zibo-737ng", "levelup-737ng"], manifest["supportedProducts"])
         self.assertTrue(manifest["restartRequired"])
         self.assertEqual([], manifest["protectedPaths"])
 

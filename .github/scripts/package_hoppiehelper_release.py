@@ -21,6 +21,7 @@ ARCHIVE_PREFIX = "YAL-HoppieHelper"
 RELEASE_TAG_PREFIX = "r"
 SUPPORTED_PRODUCTS = (
     "zibo-737ng",
+    "levelup-737ng",
 )
 PROTECTED_PATHS: tuple[str, ...] = ()
 

@@ -2,7 +2,7 @@
 
 ## Requirements
 - X-Plane 12
-- Zibo Mod (for FMC + datarefs)
+- Zibo Mod or LevelUp 737NG
 - YAL plugin (optional if using autark mode)
 - Hoppie logon code
 
@@ -13,7 +13,7 @@
 X-Plane 12/
   Resources/
     plugins/
-      YAL_hoppiehelper/
+      YAL_HoppieHelper/
         64/
 ```
 
@@ -26,7 +26,7 @@ X-Plane 12/
 
 ## Usage (YAL mode)
 - Logon is read from `YAL/hoppie/logon`.
-- Callsign is supplied by the FMC via `hoppiebridge/send_callsign`.
+- Callsign is supplied by the aircraft FMC via `hoppiebridge/send_callsign`.
 - The helper sets `hoppiebridge/comm_ready` and `laminar/B738/HBDR_ready`.
 
 ## Autark Mode (optional)
@@ -56,4 +56,4 @@ Remove the file to disable autark mode. Zibo tailnum gating still applies.
 - Increase debug level (YAL dataref or pref file) if needed.
 
 ## Uninstall
-Remove `X-Plane 12/Resources/plugins/YAL_hoppiehelper`.
+Remove `X-Plane 12/Resources/plugins/YAL_HoppieHelper`.

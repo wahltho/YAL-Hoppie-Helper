@@ -1,10 +1,10 @@
 # YAL Hoppie Helper (C++)
 
 This helper provides the HTTP POST layer for Hoppie ACARS and feeds the
-`hoppiebridge/*` datarefs required by the Zibo FMC. YAL stays functional
-without this helper; CPDLC simply remains inactive.
+`hoppiebridge/*` datarefs used by the Zibo and LevelUp 737NG aircraft.
+It installs X-Plane-wide under `Resources/plugins/YAL_HoppieHelper`.
 
-Autark modus without YAL available.
+YAL integration is optional. Autark mode works without YAL.
 
 Docs:
 - Install and deploy: `INSTALL.md`
