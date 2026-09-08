@@ -105,7 +105,9 @@ first step if the mode does not change as expected.
 
 ## 4. Enable Datalink in Zibo Mod
 
-The recommended configuration uses the FANS CDU pages:
+Both supported CDU configurations provide datalink access. The following
+configuration uses the FANS CDU pages because those page names are used in the
+remainder of this guide:
 
 1. Open the Zibo EFB and go to Home page 2.
 2. Open `SETTINGS -> OPTIONAL ACCESS -> FMS`.
@@ -115,12 +117,32 @@ The recommended configuration uses the FANS CDU pages:
 6. Select the online network you use under `ONLINE NETWORK`.
 7. Set `METAR SOURCE` to `NETWORK` for the Hoppie's ACARS weather test below.
 
-The classic `MCDU` with `CMU-900` and `ATN B1` also exposes datalink pages, but
-the page layout and labels differ. The FANS configuration is used for all CDU
-paths in the remainder of this guide.
+The classic `MCDU` with `CMU-900` and `ATN B1` also exposes datalink pages and
+does not require the FANS CDU. Only the page layout and labels differ.
 
 Press the CDU `MENU` key. A `DLK` entry must be visible. If it is missing, check
 the EFB `CMU` and `CPDLC` settings before troubleshooting the helper.
+
+### Optional LevelUp FANS CDU Patch
+
+YAL HoppieHelper also supports the LevelUp 737NG Series. LevelUp can use the
+helper and CPDLC without an additional CDU patch. An optional
+[LevelUp FANS CDU patch](https://github.com/wahltho/X-Plane-LevelUp-737NG-FANS-CDU)
+adds switchable FANS CDU labels and the corresponding tablet selection to the
+LevelUp aircraft.
+
+The patch is available as a standalone GitHub release and through the
+[737NG Maintenance Toolkit](https://github.com/wahltho/xplane-737ng-maintenance-toolkit).
+In the Toolkit, select a detected LevelUp installation and install `LevelUp
+FANS CDU` from `Components & Aircraft Patches`. It is an explicit opt-in patch,
+is never installed as part of an aircraft update, and requires an X-Plane
+restart after installation. The current verified package is `v0.1.5` for the
+LevelUp V2.S1.50 reference assets.
+
+This optional aircraft patch is separate from YAL HoppieHelper. The helper
+remains installed once, X-Plane-wide, at
+`Resources/plugins/YAL_HoppieHelper`, and neither YAL nor the FANS CDU patch is
+a prerequisite for its standalone Hoppie transport.
 
 ## 5. Set the Aircraft Callsign
 

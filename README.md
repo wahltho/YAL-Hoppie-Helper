@@ -8,7 +8,8 @@ YAL integration is optional. Autark mode works without YAL.
 
 Docs:
 - Install and deploy: `INSTALL.md`
-- Complete Zibo ACARS/CPDLC setup: `ACARS_CPDLC_GUIDE.md`
+- Complete Zibo ACARS/CPDLC setup, including the optional LevelUp FANS CDU
+  patch: `ACARS_CPDLC_GUIDE.md`
 - Build instructions: `BUILD.md`
 
 GitHub releases are packaged from the committed deploy artifacts through `.github/workflows/github-release.yml` and publish a ZIP, text manifest, JSON manifest, and SHA-256 checksums file.
