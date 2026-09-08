@@ -22,7 +22,10 @@ X-Plane 12/
 - Linux: `lin.xpl`
 - Windows: `win.xpl`
 
-(Use the staged files from `deploy/YAL_hoppiehelper/64` after a build. The active CMake build directories live outside the repo at `/Users/wahltho/dev/YAL Hoppiehelper/`.)
+(Use the staged files from `deploy/YAL_HoppieHelper/64` after a build. The active CMake build directories live outside the repo at `/Users/wahltho/dev/YAL Hoppiehelper/`.)
+
+For the complete Hoppie's ACARS account, Zibo EFB, CDU, METAR/ATIS, CPDLC and
+voice setup, continue with `ACARS_CPDLC_GUIDE.md`.
 
 ## Usage (YAL mode)
 - Logon is read from `YAL/hoppie/logon`.

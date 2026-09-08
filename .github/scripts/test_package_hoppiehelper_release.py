@@ -41,6 +41,10 @@ class ReleasePackageTests(unittest.TestCase):
             "Current plugin version: 2.1b1\n",
             encoding="utf-8",
         )
+        (self.root / "ACARS_CPDLC_GUIDE.md").write_text(
+            "ACARS and CPDLC setup\n",
+            encoding="utf-8",
+        )
         (self.root / "INSTALL.md").write_text("install\n", encoding="utf-8")
         (self.root / "LICENSE").write_text("license\n", encoding="utf-8")
         (self.root / "deploy/YAL_HoppieHelper/64/mac.xpl").write_bytes(b"mac plugin\n")

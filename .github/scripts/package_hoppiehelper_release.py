@@ -29,6 +29,7 @@ PACKAGE_MAP = (
     ("deploy/YAL_HoppieHelper/64/mac.xpl", "64/mac.xpl"),
     ("deploy/YAL_HoppieHelper/64/lin.xpl", "64/lin.xpl"),
     ("deploy/YAL_HoppieHelper/64/win.xpl", "64/win.xpl"),
+    ("ACARS_CPDLC_GUIDE.md", "ACARS_CPDLC_GUIDE.md"),
     ("INSTALL.md", "INSTALL.md"),
     ("LICENSE", "LICENSE"),
     ("README.md", "README.md"),
